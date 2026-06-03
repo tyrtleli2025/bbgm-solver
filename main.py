@@ -258,18 +258,26 @@ def main(argv: list[str] | None = None) -> int:
         print()
         return 0
 
-    print(
-        f"  Scanning {n_teams} teams for 1-for-1 and 2-for-1 trades …",
-        end=" ",
-        flush=True,
-    )
+    print(f"  Scanning {n_teams} teams for 1-for-1 and 2-for-1 trades …\n")
+
+    def _on_progress(team_name: str, n_done: int, n_total: int) -> None:
+        bar_w   = 24
+        filled  = int(bar_w * n_done / max(n_total, 1))
+        bar     = "█" * filled + "░" * (bar_w - filled)
+        print(
+            f"\r  [{bar}] {n_done:>2}/{n_total}  {team_name:<12}",
+            end="",
+            flush=True,
+        )
+
     trades = find_best_trades(
         my_roster_df,
         league_rosters_dict,
         asset_value_floor=args.asset_floor,
         top_n=args.top,
+        progress=_on_progress,
     )
-    print(f"done.  {len(trades)} trade(s) found.\n")
+    print(f"\r  Done — {len(trades)} trade(s) found.{' ' * 30}\n")
 
     _print_trades(trades)
 
