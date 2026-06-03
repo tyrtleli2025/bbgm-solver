@@ -52,6 +52,14 @@ ASSET_FLOOR_DEFAULT: float = -5.0
 """Minimum acceptable net_asset_value.  Trades costing more than this
 in asset value are pre-filtered before the optimizer is invoked."""
 
+MAX_AI_LOSS: float = 3.0
+"""Maximum asset value the opposing team is allowed to lose in a trade.
+A trade where delta = their_outgoing_value - our_outgoing_value > MAX_AI_LOSS
+means we are gaining too much value for a realistic AI counterpart to accept.
+Discarding such trades removes unrealistic lopsided recommendations.
+Combined with ASSET_FLOOR_DEFAULT this creates a fair-trade window:
+    ASSET_FLOOR_DEFAULT ≤ net_asset_value ≤ MAX_AI_LOSS"""
+
 TOP_N_DEFAULT: int = 5
 """Maximum number of results returned by find_best_trades."""
 
@@ -178,12 +186,19 @@ def _enumerate_1for1(
     my_vals: list[float],
     their_vals: list[float],
     floor: float,
+    ai_loss_cap: float,
 ) -> list[tuple[list[int], list[int]]]:
-    """All (my_indices, their_indices) pairs for 1-for-1 that pass the value floor."""
+    """
+    All (my_indices, their_indices) pairs for 1-for-1 that pass both value filters.
+
+    delta = their_vals[j] - my_vals[i]  (our net gain = their net loss)
+    Accepted when: floor ≤ delta ≤ ai_loss_cap
+    """
     out = []
     for i in range(n_mine):
         for j in range(n_theirs):
-            if their_vals[j] - my_vals[i] >= floor:
+            delta = their_vals[j] - my_vals[i]
+            if floor <= delta <= ai_loss_cap:
                 out.append(([i], [j]))
     return out
 
@@ -194,13 +209,20 @@ def _enumerate_2for1(
     my_vals: list[float],
     their_vals: list[float],
     floor: float,
+    ai_loss_cap: float,
 ) -> list[tuple[list[int], list[int]]]:
-    """All (my_indices, their_indices) for 2-for-1 that pass the value floor."""
+    """
+    All (my_indices, their_indices) for 2-for-1 that pass both value filters.
+
+    delta = their_vals[j] - (my_vals[i1] + my_vals[i2])  (our net gain)
+    Accepted when: floor ≤ delta ≤ ai_loss_cap
+    """
     out = []
     for i1, i2 in itertools.combinations(range(n_mine), 2):
         combined_my = my_vals[i1] + my_vals[i2]
         for j in range(n_theirs):
-            if their_vals[j] - combined_my >= floor:
+            delta = their_vals[j] - combined_my
+            if floor <= delta <= ai_loss_cap:
                 out.append(([i1, i2], [j]))
     return out
 
@@ -215,6 +237,7 @@ def find_best_trades(
     league_rosters_dict: dict[str, pd.DataFrame],
     salary_scale: float = SALARY_SCALE,
     asset_value_floor: float = ASSET_FLOOR_DEFAULT,
+    max_ai_loss: float = MAX_AI_LOSS,
     top_n: int = TOP_N_DEFAULT,
     progress: Callable[[str, int, int], None] | None = None,
 ) -> list[dict]:
@@ -226,17 +249,23 @@ def find_best_trades(
 
     Filtering (applied in this order for efficiency)
     -------------------------------------------------
-    1. Asset value pre-filter — discard candidates where
-           incoming_value − outgoing_value < asset_value_floor
-       before the expensive lineup optimizer is invoked.
-    2. Lineup score filter — discard trades with net_lineup_score ≤ 0.
+    Let delta = their_outgoing_value − our_outgoing_value (our net asset gain).
+
+    1. Our floor   : delta ≥ asset_value_floor  (we don't give away too much).
+    2. AI cap      : delta ≤ max_ai_loss         (opposing team doesn't lose too much).
+       Together these define a realistic fair-trade window.  Candidates outside
+       the window are discarded before the expensive lineup optimizer is called.
+    3. Lineup filter: net_lineup_score > 0 after running the fast optimizer.
 
     Parameters
     ----------
     my_roster_df        : my team's roster DataFrame (one row per player).
     league_rosters_dict : dict mapping team name → roster DataFrame.
     salary_scale        : passed through to calculate_asset_value (default 1 000).
-    asset_value_floor   : minimum acceptable net_asset_value delta (default −5).
+    asset_value_floor   : lower bound on net_asset_value delta (default −5.0).
+    max_ai_loss         : upper bound on net_asset_value delta (default 3.0).
+                          Trades where we gain more than this are discarded as
+                          unrealistically lopsided for the AI to accept.
     top_n               : maximum results to return (default 5).
     progress            : optional callable(team_name, n_done, n_total) invoked
                           after each team is processed — use for progress bars.
@@ -286,13 +315,13 @@ def find_best_trades(
         candidates: list[tuple[list[int], list[int], str]] = []
 
         for my_idx, their_idx in _enumerate_1for1(
-            n_mine, n_theirs, my_vals, their_vals, asset_value_floor
+            n_mine, n_theirs, my_vals, their_vals, asset_value_floor, max_ai_loss
         ):
             candidates.append((my_idx, their_idx, "1-for-1"))
 
         if n_mine >= 6:
             for my_idx, their_idx in _enumerate_2for1(
-                n_mine, n_theirs, my_vals, their_vals, asset_value_floor
+                n_mine, n_theirs, my_vals, their_vals, asset_value_floor, max_ai_loss
             ):
                 candidates.append((my_idx, their_idx, "2-for-1"))
 

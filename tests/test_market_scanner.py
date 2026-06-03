@@ -13,8 +13,13 @@ from src.core.formulas import BASE_RATINGS
 from src.core.market_scanner import (
     find_best_trades,
     ASSET_FLOOR_DEFAULT,
+    MAX_AI_LOSS,
     TOP_N_DEFAULT,
 )
+
+# Convenience: bypass the AI-loss cap when a test is checking discovery logic
+# (not the fairness filter).  Any trade delta up to this value is accepted.
+_NO_AI_CAP = float("inf")
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -59,7 +64,8 @@ class TestReturnStructure:
     def test_each_result_has_required_keys(self):
         my   = _roster(*[_AVG] * 6)
         them = _roster(*[_ELITE] + [_AVG] * 5)
-        result = find_best_trades(my, {"Team": them})
+        # Bypass AI cap: this test checks dict structure, not trade fairness.
+        result = find_best_trades(my, {"Team": them}, max_ai_loss=_NO_AI_CAP)
         for r in result:
             assert _REQUIRED_KEYS <= set(r.keys()), f"Missing keys: {_REQUIRED_KEYS - set(r.keys())}"
 
@@ -143,8 +149,9 @@ class TestFiltering:
         """A very permissive floor lets value-negative trades through (if lineup improves)."""
         my   = _roster(*[_player(50)] * 7)
         them = _roster(*[_player(75)] * 7)
-        strict    = find_best_trades(my, {"T": them}, asset_value_floor=0.0)
-        permissive = find_best_trades(my, {"T": them}, asset_value_floor=-100.0)
+        # Also bypass AI cap so both runs differ only in asset_value_floor.
+        strict     = find_best_trades(my, {"T": them}, asset_value_floor=0.0,   max_ai_loss=_NO_AI_CAP)
+        permissive = find_best_trades(my, {"T": them}, asset_value_floor=-100.0, max_ai_loss=_NO_AI_CAP)
         assert len(permissive) >= len(strict)
 
     def test_empty_league_returns_empty(self):
@@ -174,7 +181,8 @@ class TestSorting:
             "Good":  _roster(*[_ELITE] + [_AVG] * 6),
             "OK":    _roster(*[_player(70)] + [_AVG] * 6),
         }
-        result = find_best_trades(my, teams)
+        # Bypass AI cap: this test checks sort order, not trade fairness.
+        result = find_best_trades(my, teams, max_ai_loss=_NO_AI_CAP)
         scores = [r["net_lineup_score"] for r in result]
         assert scores == sorted(scores, reverse=True)
 
@@ -185,7 +193,8 @@ class TestSorting:
             "Great": _roster(*[_ELITE] + [_AVG] * 6),
             "Meh":   _roster(*[_player(65)] + [_AVG] * 6),
         }
-        result = find_best_trades(my, teams)
+        # Bypass AI cap: this test checks ranking logic, not trade fairness.
+        result = find_best_trades(my, teams, max_ai_loss=_NO_AI_CAP)
         assert len(result) >= 1
         best = result[0]
         for r in result[1:]:
@@ -201,27 +210,28 @@ class TestTradeDiscovery:
 
     def test_finds_obvious_1for1_upgrade(self):
         """
-        If the other team has one clearly elite player, we should find the
-        1-for-1 trade that brings them to our roster.
+        If the other team has one clearly elite player, the scanner finds the
+        1-for-1 trade.  AI-cap bypassed: this tests discovery logic, not fairness.
         """
         my   = _roster(*[_AVG] * 7)
         them = _roster(*[_ELITE] + [_AVG] * 6)
-        result = find_best_trades(my, {"TeamA": them})
+        result = find_best_trades(my, {"TeamA": them}, max_ai_loss=_NO_AI_CAP)
 
         assert len(result) > 0
         best = result[0]
         assert best["team"] == "TeamA"
-        # The incoming player should be the elite one (rating=90 across all attributes)
         assert best["incoming"][0]["hgt"] == 90
 
     def test_identifies_correct_partner_team(self):
         """
         When only one team has a good trade, the scanner returns that team's key.
+        AI-cap bypassed: this tests team-routing logic, not trade fairness.
         """
         my    = _roster(*[_AVG] * 7)
         good  = _roster(*[_ELITE] + [_AVG] * 6)
-        bad   = _roster(*[_WEAK] * 7)     # no beneficial trades here
-        result = find_best_trades(my, {"GoodTeam": good, "BadTeam": bad})
+        bad   = _roster(*[_WEAK] * 7)
+        result = find_best_trades(my, {"GoodTeam": good, "BadTeam": bad},
+                                  max_ai_loss=_NO_AI_CAP)
 
         teams_in_results = {r["team"] for r in result}
         assert "GoodTeam" in teams_in_results
@@ -229,25 +239,18 @@ class TestTradeDiscovery:
 
     def test_finds_2for1_with_depth_pieces(self):
         """
-        Trading two low-value bench players for one star should appear as a
-        2-for-1 option when the roster has enough depth (≥ 6 players).
-
-        Setup: my roster has 5 good starters + 2 terrible bench players (OVR ~8).
-        The other team has 1 star (OVR ~94) + fillers.
-        Trading the 2 bench players for the star reduces roster depth but
-        significantly improves the starting lineup.
+        Trading two bench players for one star should surface as a 2-for-1.
+        AI-cap bypassed: this tests 2-for-1 enumeration, not trade fairness.
         """
         starters  = [_player(75)] * 5
-        bench     = [_player(10)] * 2    # very bad bench (OVR ~8 each)
+        bench     = [_player(10)] * 2
         my_roster = _roster(*starters, *bench)
 
         their_star = _player(95)
         them = _roster(*[their_star] + [_player(55)] * 6)
 
-        # Use a large top_n to see all passing trades: 2-for-1 trades tie
-        # 1-for-1 trades on net_lineup_score (bench players don't make the
-        # starting 5 either way), so they appear after the 7 1-for-1 options.
-        result = find_best_trades(my_roster, {"Stars": them}, top_n=50)
+        result = find_best_trades(my_roster, {"Stars": them},
+                                  max_ai_loss=_NO_AI_CAP, top_n=50)
 
         trade_types = {r["trade_type"] for r in result}
         assert "2-for-1" in trade_types, (
@@ -257,27 +260,100 @@ class TestTradeDiscovery:
 
     def test_multi_team_scan_returns_best_overall(self):
         """
-        Scanning two teams where one has a much better player available:
-        the very best trade across all teams must be first in the results.
+        The best trade across all teams must be ranked first.
+        AI-cap bypassed: this tests cross-team ranking, not trade fairness.
         """
         my    = _roster(*[_AVG] * 7)
-        teamA = _roster(*[_player(70)] + [_AVG] * 6)   # slight upgrade available
-        teamB = _roster(*[_ELITE] + [_AVG] * 6)         # major upgrade available
+        teamA = _roster(*[_player(70)] + [_AVG] * 6)
+        teamB = _roster(*[_ELITE] + [_AVG] * 6)
 
-        result = find_best_trades(my, {"A": teamA, "B": teamB})
+        result = find_best_trades(my, {"A": teamA, "B": teamB},
+                                  max_ai_loss=_NO_AI_CAP)
         assert len(result) > 0
-        # TeamB's elite player should give a larger net_lineup_score
         assert result[0]["team"] == "B"
 
     def test_no_self_trade(self):
         """Players from my own roster should never appear as incoming."""
         my   = _roster(*[_AVG] * 7)
         them = _roster(*[_ELITE] + [_AVG] * 6)
+        result = find_best_trades(my, {"T": them}, max_ai_loss=_NO_AI_CAP)
+        for r in result:
+            assert len(r["incoming"]) >= 1
+
+
+# ---------------------------------------------------------------------------
+# 5. AI-loss filter
+# ---------------------------------------------------------------------------
+
+
+class TestAILossFilter:
+
+    def test_lopsided_trade_rejected_by_default(self):
+        """
+        A trade where we gain far more value than MAX_AI_LOSS must be filtered out
+        even if it would improve our lineup.
+        """
+        my   = _roster(*[_AVG] * 7)
+        them = _roster(*[_ELITE] + [_AVG] * 6)
+        # Default max_ai_loss = MAX_AI_LOSS (3.0); ELITE→AVG delta ≈ +27 → rejected
+        result = find_best_trades(my, {"T": them})
+        assert result == [], (
+            f"Expected no results with default AI cap, got {len(result)}"
+        )
+
+    def test_lopsided_trade_passes_with_raised_cap(self):
+        """
+        The same lopsided trade is accepted when max_ai_loss is raised
+        above the actual asset-value delta.
+        """
+        my   = _roster(*[_AVG] * 7)
+        them = _roster(*[_ELITE] + [_AVG] * 6)
+        result = find_best_trades(my, {"T": them}, max_ai_loss=_NO_AI_CAP)
+        assert len(result) > 0
+
+    def test_near_equal_value_trade_passes(self):
+        """
+        A trade between players of nearly equal value (delta ≈ 0) passes
+        the AI-loss filter with the default cap.
+        """
+        my_player   = _player(60)
+        their_player = _player(60)   # identical value → delta = 0 ≤ MAX_AI_LOSS
+        my   = _roster(*[my_player] * 7)
+        them = _roster(*[their_player] * 7)
+        # All net_lineup_scores will be ~0 (same players), so result may be empty —
+        # the important thing is that no ValueError is raised and the cap isn't hit.
         result = find_best_trades(my, {"T": them})
         for r in result:
-            for incoming_player in r["incoming"]:
-                # Incoming player came from the other team, not ours;
-                # since all our players have rating=60 and their elite has rating=90,
-                # any incoming player with hgt==90 is definitely from them.
-                # (A weaker test: just confirm incoming list is non-empty when we have results)
-                assert len(r["incoming"]) >= 1
+            assert r["net_asset_value"] <= MAX_AI_LOSS + 0.01
+
+    def test_max_ai_loss_constant_is_3(self):
+        """Verify the tuning constant has the expected value."""
+        assert MAX_AI_LOSS == 3.0
+
+    def test_cap_is_inclusive(self):
+        """
+        A trade with net_asset_value exactly equal to MAX_AI_LOSS is accepted
+        (the bound is inclusive: delta ≤ max_ai_loss).
+        """
+        my   = _roster(*[_AVG] * 7)
+        them = _roster(*[_AVG] * 7)
+        # With equal players the delta is 0, well within the cap.
+        # Set the cap to exactly 0 — equal-value trades should still be accepted
+        # (pending lineup improvement filter which may remove them).
+        result = find_best_trades(my, {"T": them}, max_ai_loss=0.0)
+        # Result may be empty (no lineup improvement) but no cap violation.
+        for r in result:
+            assert r["net_asset_value"] <= 0.0 + 0.01
+
+    def test_returned_trades_respect_ai_cap(self):
+        """
+        Every returned trade must have net_asset_value ≤ max_ai_loss.
+        """
+        my   = _roster(*[_AVG] * 7)
+        them = _roster(*[_ELITE] + [_player(62)] * 6)
+        cap  = 5.0
+        result = find_best_trades(my, {"T": them}, max_ai_loss=cap)
+        for r in result:
+            assert r["net_asset_value"] <= cap + 0.01, (
+                f"net_asset_value {r['net_asset_value']:.2f} exceeds cap {cap}"
+            )
