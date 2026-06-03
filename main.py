@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""
+BBGM Solver — command-line interface.
+
+Usage
+-----
+    python main.py --file path/to/league_export.json
+    python main.py --file path/to/league_export.json --tid 3
+    python main.py --file path/to/league_export.json --tid 0 --top 10 --asset-floor -8
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import textwrap
+
+from src.core.formulas import player_ovr
+from src.core.market_scanner import find_best_trades
+from src.core.optimizer import optimize_rotation
+from src.core.parser import parse_league_json
+
+# ---------------------------------------------------------------------------
+# Layout constants
+# ---------------------------------------------------------------------------
+
+_W = 64          # total line width for separators
+_NAME_W = 24     # player name column width
+_POS_W  = 5      # position column width
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+
+def _rule(char: str = "─", width: int = _W) -> str:
+    return char * width
+
+
+def _section(title: str, char: str = "─") -> str:
+    pad = max(0, _W - len(title) - 5)
+    return f"\n{char * 3} {title} {char * pad}"
+
+
+def _signed(val: float) -> str:
+    """Format a signed float with a direction arrow: '▲ +12.3' or '▼  -4.1'."""
+    arrow = "▲" if val >= 0 else "▼"
+    return f"{arrow} {val:+.1f}"
+
+
+def _player_line(p: dict | object, label: str, prefix: str) -> str:
+    """
+    Render a single player row for trade display.
+
+    *p* may be a plain dict (from market-scanner results) or a pd.Series row.
+    """
+    if hasattr(p, "get"):
+        name = str(p.get("name") or f"pid_{p.get('pid', '?')}")
+        pos  = str(p.get("pos")  or "")
+        age  = p.get("age",  0) or 0
+        ovr  = player_ovr(p)
+    else:
+        name, pos, age, ovr = str(p), "", 0, 0
+
+    return (
+        f"      {prefix} {label:<3} "
+        f"{name:<{_NAME_W}} "
+        f"{pos:<{_POS_W}} "
+        f"age {int(age):<3} "
+        f"OVR {ovr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section printers
+# ---------------------------------------------------------------------------
+
+
+def _print_banner(season: int, team_label: str, my_tid: int) -> None:
+    bar = "═" * _W
+    title = f"  BBGM Solver"
+    meta  = f"Season {season}  •  Team: {team_label} (tid={my_tid})"
+    print(f"\n╔{bar}╗")
+    print(f"║{title:<{_W}}║")
+    print(f"║  {meta:<{_W - 2}}║")
+    print(f"╚{bar}╝")
+
+
+def _print_lineup(result: dict) -> None:
+    lineup  = result["lineup"]
+    syn     = result["synergy"]
+    score   = result["score"]
+    ovr_sum = result["ovr_sum"]
+
+    print()
+    hdr = f"    {'#':<4}{'Name':<{_NAME_W + 1}}{'Pos':<{_POS_W + 1}}{'Age':<5}{'OVR'}"
+    print(hdr)
+    print(f"    {_rule(char='─', width=len(hdr) - 4)}")
+
+    for i in range(len(lineup)):
+        row  = lineup.iloc[i]
+        name = str(row.get("name") or f"pid_{int(row.get('pid', i))}")
+        pos  = str(row.get("pos")  or "")
+        age  = int(row.get("age", 0) or 0)
+        ovr  = player_ovr(row)
+        print(f"    {i + 1:<4}{name:<{_NAME_W + 1}}{pos:<{_POS_W + 1}}{age:<5}{ovr}")
+
+    print()
+    print(f"    OVR Sum : {ovr_sum}")
+    print(f"    Synergy : Off {syn['off']:.3f}  |  Def {syn['def']:.3f}  |  Reb {syn['reb']:.3f}")
+    print(f"    Score   : {score:.1f}")
+    print()
+
+
+def _print_trades(trades: list[dict]) -> None:
+    print()
+
+    if not trades:
+        print("    No beneficial trades found above the quality threshold.")
+        print("    Try loosening --asset-floor (e.g. --asset-floor -15).")
+        print()
+        return
+
+    for rank, t in enumerate(trades, 1):
+        team   = t["team"]
+        ttype  = t["trade_type"]
+        net_l  = t["net_lineup_score"]
+        net_a  = t["net_asset_value"]
+
+        print(
+            f"  #{rank:<2}  {team:<10}  {ttype:<8}  "
+            f"Lineup {_signed(net_l):>9}   "
+            f"Value {_signed(net_a):>9}"
+        )
+
+        incoming = t["incoming"]
+        outgoing = t["outgoing"]
+        all_rows = (
+            [(p, "IN",  "┌─") for p in incoming]
+            + [(p, "OUT", "└─") for p in outgoing]
+        )
+        # Fix middle-row prefixes for multi-player legs
+        for idx, (p, label, _) in enumerate(all_rows):
+            is_last = idx == len(all_rows) - 1
+            prefix  = "└─" if is_last else ("┌─" if idx == 0 else "├─")
+            print(_player_line(p, label, prefix))
+
+        print()
+
+    print(_rule())
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="bbgm-solver",
+        description="Optimal lineup finder and trade scanner for Basketball GM.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            examples:
+              python main.py --file league.json
+              python main.py --file league.json --tid 3
+              python main.py --file league.json --tid 0 --top 10 --asset-floor -10
+        """),
+    )
+    ap.add_argument(
+        "--file",
+        required=True,
+        metavar="PATH",
+        help="Path to the ZenGM league export JSON file.",
+    )
+    ap.add_argument(
+        "--tid",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Team ID of your team in the export (default: 0).",
+    )
+    ap.add_argument(
+        "--top",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Number of trade recommendations to display (default: 5).",
+    )
+    ap.add_argument(
+        "--asset-floor",
+        type=float,
+        default=-5.0,
+        dest="asset_floor",
+        metavar="F",
+        help=(
+            "Minimum acceptable net asset value change for a trade to be "
+            "considered (default: -5.0). More negative = more permissive."
+        ),
+    )
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+
+    # ── 1. Parse ─────────────────────────────────────────────────────────────
+    print(f"\nLoading {args.file} …", end=" ", flush=True)
+    try:
+        my_roster_df, league_rosters_dict = parse_league_json(
+            args.file, my_tid=args.tid
+        )
+    except FileNotFoundError:
+        print()
+        print(f"Error: file not found — {args.file}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print()
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    n_my     = len(my_roster_df)
+    n_teams  = len(league_rosters_dict)
+    n_others = sum(len(df) for df in league_rosters_dict.values())
+    print(f"done.")
+
+    # Try to infer a team label from the league dict (our team won't be in it)
+    my_label = f"tid={args.tid}"
+
+    # If the JSON has a season we can show it; read from the DataFrame if possible
+    # (parser doesn't return season, so we just skip it gracefully)
+    print(
+        f"  My roster  : {n_my} active players\n"
+        f"  Opponents  : {n_teams} teams  ({n_others} players)\n"
+    )
+
+    # ── 2. Optimal lineup ────────────────────────────────────────────────────
+    print(_section("OPTIMAL STARTING LINEUP", "━"))
+
+    if n_my < 5:
+        print(f"\n  Error: need at least 5 players on my roster, found {n_my}.")
+        return 1
+
+    print("\n  Optimising lineup …", end=" ", flush=True)
+    lineup_result = optimize_rotation(my_roster_df)
+    print("done.")
+
+    _print_lineup(lineup_result)
+
+    # ── 3. Market scan ───────────────────────────────────────────────────────
+    print(_section("TOP TRADE RECOMMENDATIONS", "━"))
+    print()
+
+    if not league_rosters_dict:
+        print("  No opponent rosters found in the export; skipping trade scan.")
+        print()
+        return 0
+
+    print(
+        f"  Scanning {n_teams} teams for 1-for-1 and 2-for-1 trades …",
+        end=" ",
+        flush=True,
+    )
+    trades = find_best_trades(
+        my_roster_df,
+        league_rosters_dict,
+        asset_value_floor=args.asset_floor,
+        top_n=args.top,
+    )
+    print(f"done.  {len(trades)} trade(s) found.\n")
+
+    _print_trades(trades)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
