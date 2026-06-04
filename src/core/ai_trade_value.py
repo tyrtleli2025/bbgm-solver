@@ -47,6 +47,14 @@ SALARY_CAP_DEFAULT: float = 90_000.0
 SOFT_CAP_MATCH_PCT: float = 1.25
 """Soft-cap rule: incoming salary ≤ 125 % of outgoing when over the cap."""
 
+# These are the implicit centre and spread of the OVR-normalised scale produced
+# by player_base_value().  The normalisation formula maps an average player to
+# exactly 47 and one OVR-std above average to 57, so the target spread is 10.
+# ZenGM calls these "playerOvrMean / playerOvrStd" and does not compute them
+# from a second pass over player.value — they are fixed by the formula.
+_VALUE_CENTRE: float = 47.0
+_VALUE_SCALE: float  = 10.0
+
 # ---------------------------------------------------------------------------
 # Type aliases
 # ---------------------------------------------------------------------------
@@ -204,13 +212,11 @@ def league_value_stats(
     salary_cap: float = SALARY_CAP_DEFAULT,
 ) -> League:
     """
-    Compute league-wide OVR and player-value statistics needed for z-scoring.
+    Compute league-wide OVR statistics needed for z-scoring.
 
-    Two-pass process (§ 3–4):
-    1. Compute mean/std of player_ovr() across all rostered players
-       → used to normalise OVR in player_base_value().
-    2. Compute mean/std of player_base_value() across all players
-       → used in zscore() before the nonlinearity.
+    ZenGM does not compute a separate second pass over player.value — it
+    z-scores player.value directly against the OVR distribution (§ 4):
+        v = (player.value − ovr_mean) / ovr_std
 
     Parameters
     ----------
@@ -221,7 +227,7 @@ def league_value_stats(
 
     Returns
     -------
-    League dict with keys: ovr_mean, ovr_std, value_mean, value_std,
+    League dict with keys: ovr_mean, ovr_std,
     salary_cap, current_season, is_offseason.
     """
     all_players = [
@@ -233,34 +239,17 @@ def league_value_stats(
     if not all_players:
         return dict(
             ovr_mean=47.0, ovr_std=10.0,
-            value_mean=47.0, value_std=10.0,
             salary_cap=salary_cap,
             current_season=current_season,
             is_offseason=is_offseason,
         )
 
-    # Pass 1 — OVR statistics
     ovrs     = np.array([player_ovr(p) for p in all_players], dtype=float)
     ovr_mean = float(ovrs.mean())
     ovr_std  = float(max(ovrs.std(), 1.0))
 
-    # Bootstrap League (value_mean/std not consumed by player_base_value)
-    _boot: League = dict(
-        ovr_mean=ovr_mean, ovr_std=ovr_std,
-        value_mean=47.0, value_std=10.0,
-        salary_cap=salary_cap,
-        current_season=current_season,
-        is_offseason=is_offseason,
-    )
-
-    # Pass 2 — player.value statistics
-    vals       = np.array([player_base_value(p, _boot) for p in all_players], dtype=float)
-    value_mean = float(vals.mean())
-    value_std  = float(max(vals.std(), 1.0))
-
     return dict(
         ovr_mean=ovr_mean, ovr_std=ovr_std,
-        value_mean=value_mean, value_std=value_std,
         salary_cap=salary_cap,
         current_season=current_season,
         is_offseason=is_offseason,
@@ -325,8 +314,9 @@ def contract_value(
     Parameters
     ----------
     player          : must contain 'salary' ($K) and 'contract_exp' (year).
-    normalized_value: the player's z-score (post-strategy) used to estimate
-                      what salary the market would offer for this value level.
+    normalized_value: the player's RAW z-score (pre-difficulty, pre-strategy)
+                      used to estimate what salary the market would offer.
+                      sum_values() passes raw_v here, not the adjusted value.
     league          : supplies salary_cap, current_season, is_offseason.
     """
     salary_cap     = float(league["salary_cap"])
@@ -393,31 +383,43 @@ def sum_values(
     for player in assets:
         age = float(_get(player, "age") or 27.0)
 
-        # 1. Base z-score
-        base = player_base_value(player, league)
-        v    = zscore(base, float(league["value_mean"]), float(league["value_std"]))
+        # 1. Base z-score (§ 4).
+        #    player_base_value() normalises OVR to mean ≈ 47, std ≈ 10 by design.
+        #    ZenGM z-scores directly against those fixed constants (playerOvrMean/Std)
+        #    rather than computing a second-pass mean/std from player.value.
+        #    raw_v is preserved for contract_value() — that formula must use the
+        #    pre-adjustment z-score (§ 7).
+        base  = player_base_value(player, league)
+        raw_v = zscore(base, _VALUE_CENTRE, _VALUE_SCALE)
+        v     = raw_v
 
-        # 2. Strategy age multiplier
+        # 2. Difficulty fudge — applied only to positive values, BEFORE strategy
+        #    (§ 8: "1 + 0.1 × difficulty applied to outgoing player values").
+        if difficulty != 0.0 and v > 0:
+            v *= 1.0 + 0.1 * difficulty
+
+        # 3. Strategy age multiplier (§ 6)
         v *= _strategy_multiplier(age, strategy)
 
-        # 3. Contract value
-        cv  = contract_value(player, v, league)
-        v  += contracts_factor * cv
-
-        # 4. Injury discount (incoming AI assets only)
+        # 4. Injury discount — incoming AI assets only (§ 8)
         if include_injuries:
             games = int(_get(player, "injured_games_remaining") or 0)
             v *= _injury_factor(games)
 
-        # 5. Difficulty multiplier
-        if difficulty != 0.0:
-            v *= 1.0 + 0.1 * difficulty
-
-        # 6. Negative-value dampening
+        # 5. Negative-value dampening (§ 8) — applied BEFORE contract addition
         if v < 0:
             v /= 20.0
 
-        # 7. Star exponent
+        # 6. Contract value — computed from the RAW z-score (§ 7).
+        #    contractsFactor = 2 rebuilding / 0.5 contending.
+        cv  = contract_value(player, raw_v, league)
+        v  += contracts_factor * cv
+
+        # 7. Just-drafted floor: rookies can be cut, so value ≥ 0 (§ 8)
+        if _get(player, "just_drafted"):
+            v = max(0.0, v)
+
+        # 8. Star exponent (§ 5)
         if v > 1:
             v = v ** EXPONENT
 

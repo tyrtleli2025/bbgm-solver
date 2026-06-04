@@ -21,6 +21,8 @@ from src.core.ai_trade_value import (
     CONTRACT_SLOPE,
     SALARY_CAP_DEFAULT,
     SOFT_CAP_MATCH_PCT,
+    _VALUE_CENTRE,
+    _VALUE_SCALE,
     player_base_value,
     league_value_stats,
     zscore,
@@ -33,6 +35,7 @@ from src.core.ai_trade_value import (
     is_untradable,
     _value_combine_ovr_pot,
     _strategy_multiplier,
+    _injury_factor,
 )
 
 # ---------------------------------------------------------------------------
@@ -75,10 +78,10 @@ _LEAGUE_ROSTERS = {
 }
 LEAGUE = league_value_stats(_LEAGUE_ROSTERS, current_season=SEASON, salary_cap=SALARY_CAP_DEFAULT)
 
-# Convenience: compute z-score of a player against the test league
+# Convenience: compute z-score using the same fixed-constant formula as sum_values
 def _z(player: dict) -> float:
     base = player_base_value(player, LEAGUE)
-    return zscore(base, LEAGUE["value_mean"], LEAGUE["value_std"])
+    return zscore(base, _VALUE_CENTRE, _VALUE_SCALE)
 
 
 # ---------------------------------------------------------------------------
@@ -89,20 +92,20 @@ def _z(player: dict) -> float:
 class TestLeagueStats:
 
     def test_league_has_required_keys(self):
-        for key in ("ovr_mean", "ovr_std", "value_mean", "value_std",
-                    "salary_cap", "current_season", "is_offseason"):
+        # value_mean / value_std are no longer returned — ZenGM uses fixed constants
+        for key in ("ovr_mean", "ovr_std", "salary_cap", "current_season", "is_offseason"):
             assert key in LEAGUE, f"Missing key: {key}"
 
     def test_ovr_std_positive(self):
         assert LEAGUE["ovr_std"] > 0
 
-    def test_value_std_positive(self):
-        assert LEAGUE["value_std"] > 0
+    def test_value_scale_constants_are_positive(self):
+        assert _VALUE_SCALE > 0
+        assert _VALUE_CENTRE > 0
 
     def test_empty_rosters_returns_defaults(self):
         lg = league_value_stats({})
         assert lg["ovr_mean"] == pytest.approx(47.0)
-        assert lg["value_mean"] == pytest.approx(47.0)
 
     def test_higher_ovr_gives_higher_base_value(self):
         low  = player_base_value(_player(50), LEAGUE)
@@ -508,3 +511,142 @@ class TestInferStrategy:
 
     def test_empty_roster_rebuilding(self):
         assert infer_strategy(pd.DataFrame()) == "rebuilding"
+
+
+# ---------------------------------------------------------------------------
+# 10. Golden pipeline tests
+#
+# Each test re-implements one step of sum_values inline (without calling the
+# function) and asserts the function matches to 1e-6 relative tolerance.
+# This verifies the exact operation ORDER specified in § 3–8.
+# ---------------------------------------------------------------------------
+
+# Small deterministic league used only by the golden tests
+_GOLDEN_ROSTERS = {
+    "lo": _roster(*[_player(50)] * 6),   # OVR cluster around 55
+    "hi": _roster(*[_player(75)] * 6),   # OVR cluster around 81
+}
+_GL = league_value_stats(_GOLDEN_ROSTERS, current_season=SEASON, salary_cap=SALARY_CAP_DEFAULT)
+
+
+def _manual_sum_one(
+    player: dict,
+    lg: dict,
+    strategy: str,
+    include_injuries: bool = False,
+    difficulty: float = 0.0,
+) -> float:
+    """
+    Independent re-implementation of the per-player pipeline from § 3–8.
+    Called only by the golden tests — does NOT call sum_values().
+    """
+    age = float((player.get("age") or 27.0))
+    contracts_factor = 2.0 if strategy == "rebuilding" else 0.5
+
+    # 1. Base z-score using fixed normalisation constants (≡ ZenGM playerOvrMean/Std)
+    base  = player_base_value(player, lg)
+    raw_v = (base - _VALUE_CENTRE) / _VALUE_SCALE
+    v = raw_v
+
+    # 2. Difficulty — positive values only, BEFORE strategy
+    if difficulty != 0.0 and v > 0:
+        v *= 1.0 + 0.1 * difficulty
+
+    # 3. Strategy age multiplier
+    v *= _strategy_multiplier(age, strategy)
+
+    # 4. Injury discount
+    if include_injuries:
+        games = int(player.get("injured_games_remaining") or 0)
+        v *= _injury_factor(games)
+
+    # 5. Negative dampening BEFORE contract
+    if v < 0:
+        v /= 20.0
+
+    # 6. Contract value from RAW z-score
+    cv = contract_value(player, raw_v, lg)
+    v += contracts_factor * cv
+
+    # 7. just_drafted floor (not set in test players → no-op)
+
+    # 8. Exponent
+    if v > 1:
+        v = v ** EXPONENT
+
+    return v
+
+
+class TestGoldenPipeline:
+    """
+    Hand-trace sum_values / evaluate_dv and assert exact equality (rel=1e-6).
+    Each case targets a specific ordering concern introduced in the fix.
+    """
+
+    def test_golden_prime_player_contending(self):
+        """OVR=68, age=27, salary=10K, long deal — straightforward prime player."""
+        p = _player(68, age=27, pot=68, salary=10_000, contract_exp=SEASON + 3)
+        expected = _manual_sum_one(p, _GL, "contending")
+        assert sum_values([p], _GL, "contending") == pytest.approx(expected, rel=1e-6)
+
+    def test_golden_young_prospect_rebuilding(self):
+        """age=21, high pot — rebuilder strategy and young bonus both active."""
+        p = _player(62, age=21, pot=85, salary=3_000, contract_exp=SEASON + 5)
+        expected = _manual_sum_one(p, _GL, "rebuilding")
+        assert sum_values([p], _GL, "rebuilding") == pytest.approx(expected, rel=1e-6)
+
+    def test_golden_veteran_overpaid(self):
+        """age=33, $35K salary — rebuilder penalty + contract penalty compound."""
+        p = _player(70, age=33, pot=70, salary=35_000, contract_exp=SEASON + 2)
+        expected = _manual_sum_one(p, _GL, "rebuilding")
+        assert sum_values([p], _GL, "rebuilding") == pytest.approx(expected, rel=1e-6)
+
+    def test_golden_with_difficulty(self):
+        """Difficulty=0.25 applied BEFORE strategy; verify ordering is correct."""
+        p = _player(70, age=27, pot=70, salary=8_000, contract_exp=SEASON + 3)
+        expected = _manual_sum_one(p, _GL, "contending", difficulty=0.25)
+        assert sum_values([p], _GL, "contending", difficulty=0.25) == pytest.approx(expected, rel=1e-6)
+
+    def test_golden_contract_uses_raw_not_strategy_v(self):
+        """
+        Confirm contract_value receives raw_v, not strategy-adjusted v.
+
+        For a young player (age 19) on a rebuilding team: strategy multiplier
+        is 1.075, so v_strategy = raw_v * 1.075. If contract used v_strategy,
+        the expected salary (CONTRACT_SLOPE * (v_strategy - MIN_VALUE)) would
+        be larger than when using raw_v.  We assert our pipeline matches the
+        inline calculation that explicitly passes raw_v to contract_value().
+        """
+        p = _player(65, age=19, pot=85, salary=2_000, contract_exp=SEASON + 4)
+        expected = _manual_sum_one(p, _GL, "rebuilding")
+        # If the wrong v were used, the result would differ by
+        # 2.0 * (contract_slope * (v_strategy - MIN) - contract_slope * (raw_v - MIN))
+        assert sum_values([p], _GL, "rebuilding") == pytest.approx(expected, rel=1e-6)
+
+    def test_golden_injured_incoming(self):
+        """Injury discount applied AFTER strategy but BEFORE contract."""
+        p = _player(72, age=27, pot=72, salary=12_000, contract_exp=SEASON + 3)
+        p["injured_games_remaining"] = 50
+        expected = _manual_sum_one(p, _GL, "contending", include_injuries=True)
+        assert sum_values([p], _GL, "contending", include_injuries=True) == pytest.approx(expected, rel=1e-6)
+
+    def test_golden_evaluate_dv_rebuilding(self):
+        """
+        Verify evaluate_dv = sum_values(AI receives) − sum_values(AI gives up).
+        Use an explicit rebuilding strategy override for determinism.
+        """
+        ai_roster = _roster(*[_player(60)] * 8)
+        outgoing  = _player(75, age=25, pot=80, salary=8_000, contract_exp=SEASON + 3)  # we send
+        incoming  = _player(62, age=30, pot=62, salary=5_000, contract_exp=SEASON + 1)  # AI gives
+
+        expected_dv = (
+            _manual_sum_one(outgoing, _GL, "rebuilding", include_injuries=True)
+            - _manual_sum_one(incoming, _GL, "rebuilding", include_injuries=False)
+        )
+        actual_dv = evaluate_dv(
+            ai_roster, _GL,
+            incoming=[incoming],
+            outgoing=[outgoing],
+            strategy="rebuilding",
+        )
+        assert actual_dv == pytest.approx(expected_dv, rel=1e-6)
