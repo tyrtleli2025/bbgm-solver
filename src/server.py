@@ -106,10 +106,12 @@ try{
 })()"""
 
 
-def make_bookmarklet(port: int = DEFAULT_PORT) -> str:
-    """Return the full `javascript:...` URL with the given port substituted."""
-    # Minify: collapse indentation / newlines, substitute port
+def make_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str:
+    """Return the full `javascript:...` URL with the given port and scheme substituted."""
+    # Minify: collapse indentation / newlines, substitute port and scheme
     body = BOOKMARKLET_BODY.replace("\n", "").replace("PORT", str(port))
+    # Replace http:// with the correct scheme (http or https)
+    body = body.replace("http://localhost", f"{scheme}://localhost")
     # Collapse multiple spaces that appear after removing newlines
     import re
     body = re.sub(r"  +", " ", body)
@@ -226,20 +228,11 @@ def solve(payload: dict) -> dict:
         salary_cap=cap_info["salary_cap"],
         top_n=5,
     )
-    sequences = beam_search(
-        my_roster_df,
-        league_rosters_dict,
-        league=league,
-        salary_cap=cap_info["salary_cap"],
-        depth=3,
-        beam_width=5,
-        top_n=3,
-    )
 
     return {
         "cap":       cap_info["salary_cap"],
         "trades":    _serialise_trades(trades),
-        "sequences": _serialise_sequences(sequences),
+        "sequences": [],
     }
 
 
@@ -328,7 +321,7 @@ def start_server(
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
 
-    bm = make_bookmarklet(port)
+    bm = make_bookmarklet(port, scheme=scheme)
     print()
     print("=" * 70)
     print(f"  BBGM Solver server running at {scheme}://localhost:{port}/solve")
