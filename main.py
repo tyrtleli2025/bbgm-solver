@@ -4,9 +4,10 @@ BBGM Solver — command-line interface.
 
 Usage
 -----
-    python main.py --file path/to/league_export.json
-    python main.py --file path/to/league_export.json --tid 3
-    python main.py --file path/to/league_export.json --tid 0 --top 10 --asset-floor -8
+    python main.py --file league.json
+    python main.py --file league.json --tid 3
+    python main.py --file league.json --top 10
+    python main.py --file league.json --search --depth 3 --beam 5
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from src.core.formulas import player_ovr
 from src.core.market_scanner import find_best_trades
 from src.core.optimizer import optimize_rotation
 from src.core.parser import parse_league_json
+from src.core.trade_search import beam_search, SearchResult, TradeStep
 
 # ---------------------------------------------------------------------------
 # Layout constants
@@ -117,30 +119,25 @@ def _print_trades(trades: list[dict]) -> None:
     print()
 
     if not trades:
-        print("    No beneficial trades found above the quality threshold.")
-        print("    Try loosening --asset-floor (e.g. --asset-floor -15).")
+        print("    No beneficial trades found.")
         print()
         return
 
     for rank, t in enumerate(trades, 1):
-        team   = t["team"]
-        ttype  = t["trade_type"]
-        net_l  = t["net_lineup_score"]
-        net_a  = t["net_asset_value"]
+        team  = t["team"]
+        ttype = t["trade_type"]
+        net_l = t["net_lineup_score"]
+        dv    = t.get("dv", 0.0)
 
         print(
             f"  #{rank:<2}  {team:<10}  {ttype:<8}  "
-            f"Lineup {_signed(net_l):>9}   "
-            f"Value {_signed(net_a):>9}"
+            f"Lineup {_signed(net_l):>9}   dv {_signed(dv):>9}"
         )
 
-        incoming = t["incoming"]
-        outgoing = t["outgoing"]
         all_rows = (
-            [(p, "IN",  "┌─") for p in incoming]
-            + [(p, "OUT", "└─") for p in outgoing]
+            [(p, "IN",  "┌─") for p in t["incoming"]]
+            + [(p, "OUT", "└─") for p in t["outgoing"]]
         )
-        # Fix middle-row prefixes for multi-player legs
         for idx, (p, label, _) in enumerate(all_rows):
             is_last = idx == len(all_rows) - 1
             prefix  = "└─" if is_last else ("┌─" if idx == 0 else "├─")
@@ -149,6 +146,32 @@ def _print_trades(trades: list[dict]) -> None:
         print()
 
     print(_rule())
+    print()
+
+
+def _print_sequence(result: SearchResult, rank: int) -> None:
+    """Print one trade sequence from beam_search."""
+    gain = result.total_j_gain
+    traj = result.j_trajectory
+    print(
+        f"  #{rank:<2}  {len(result.sequence)}-step sequence  "
+        f"J gain: {_signed(gain)}  "
+        f"({traj[0]:.1f} → {traj[-1]:.1f})"
+    )
+    for step_i, step in enumerate(result.sequence, 1):
+        print(
+            f"\n      Step {step_i}  {step.team:<10}  {step.trade_type:<8}  "
+            f"J: {step.j_before:.1f} → {step.j_after:.1f}  "
+            f"dv: {_signed(step.dv)}"
+        )
+        all_rows = (
+            [(p, "IN",  "┌─") for p in step.incoming]
+            + [(p, "OUT", "└─") for p in step.outgoing]
+        )
+        for idx, (p, label, _) in enumerate(all_rows):
+            is_last = idx == len(all_rows) - 1
+            prefix  = "└─" if is_last else ("┌─" if idx == 0 else "├─")
+            print(_player_line(p, label, prefix))
     print()
 
 
@@ -166,7 +189,8 @@ def _build_parser() -> argparse.ArgumentParser:
             examples:
               python main.py --file league.json
               python main.py --file league.json --tid 3
-              python main.py --file league.json --tid 0 --top 10 --asset-floor -10
+              python main.py --file league.json --top 10
+              python main.py --file league.json --search --depth 3 --beam 5
         """),
     )
     ap.add_argument(
@@ -190,15 +214,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Number of trade recommendations to display (default: 5).",
     )
     ap.add_argument(
-        "--asset-floor",
-        type=float,
-        default=-5.0,
-        dest="asset_floor",
-        metavar="F",
-        help=(
-            "Minimum acceptable net asset value change for a trade to be "
-            "considered (default: -5.0). More negative = more permissive."
-        ),
+        "--search",
+        action="store_true",
+        help="Run depth-limited beam search for the best multi-step trade sequence.",
+    )
+    ap.add_argument(
+        "--depth",
+        type=int,
+        default=3,
+        metavar="D",
+        help="Maximum trade-sequence length for --search (default: 3).",
+    )
+    ap.add_argument(
+        "--beam",
+        type=int,
+        default=5,
+        metavar="K",
+        help="Beam width (candidate trades per node) for --search (default: 5).",
     )
     return ap
 
@@ -273,13 +305,40 @@ def main(argv: list[str] | None = None) -> int:
     trades = find_best_trades(
         my_roster_df,
         league_rosters_dict,
-        asset_value_floor=args.asset_floor,
         top_n=args.top,
         progress=_on_progress,
     )
     print(f"\r  Done — {len(trades)} trade(s) found.{' ' * 30}\n")
 
     _print_trades(trades)
+
+    # ── 4. Beam search (optional) ─────────────────────────────────────────────
+    if args.search:
+        print(_section("BEST TRADE SEQUENCE (beam search)", "━"))
+        print(
+            f"\n  Searching depth={args.depth}, beam={args.beam} …",
+            end=" ",
+            flush=True,
+        )
+
+        if not league_rosters_dict:
+            print("\n  No opponent rosters — skipping sequence search.")
+            return 0
+
+        sequences = beam_search(
+            my_roster_df,
+            league_rosters_dict,
+            depth=args.depth,
+            beam_width=args.beam,
+            top_n=args.top,
+        )
+        print(f"done.  {len(sequences)} sequence(s) found.\n")
+
+        if not sequences:
+            print("  No improving trade sequences found.")
+        else:
+            for rank, seq in enumerate(sequences, 1):
+                _print_sequence(seq, rank)
 
     return 0
 
