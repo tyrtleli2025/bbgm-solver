@@ -462,6 +462,25 @@ class TestSalaryMatchOk:
         # 85K − 5K + 15K = 95K > 90K cap
         assert not salary_match_ok(5_000, 15_000, 85_000, 90_000, "hard")
 
+    def test_under_cap_absorbing_huge_contract_rejected(self):
+        """
+        A team currently under the cap that absorbs a large salary with nothing
+        outgoing must be REJECTED if the trade pushes it over the cap.
+
+        Old (wrong) logic: our_total ≤ cap → True (ignores trade effect).
+        New (correct) logic: new_payroll = 60K + 40K = 100K > 90K cap, and
+        outgoing = 0, so → False.
+        """
+        # under cap now (60K < 90K), but post-trade payroll = 100K > 90K
+        assert not salary_match_ok(0, 40_000, 60_000, 90_000, "soft"), (
+            "Under-cap team absorbing 40K with nothing outgoing should be rejected"
+        )
+
+    def test_trade_that_stays_under_cap_always_ok(self):
+        """Even if currently over cap, a trade that brings payroll under cap is fine."""
+        # Currently 95K (over cap), send 20K, receive 10K → new = 85K < 90K
+        assert salary_match_ok(20_000, 10_000, 95_000, 90_000, "soft")
+
 
 # ---------------------------------------------------------------------------
 # 8. Tradability checks

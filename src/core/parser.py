@@ -69,26 +69,48 @@ OUTPUT_COLUMNS: list[str] = BASE_RATINGS + META_COLUMNS
 # ---------------------------------------------------------------------------
 
 
-def _read_season(data: dict) -> int:
+def _read_game_attr(data: dict, key: str, default):
     """
-    Extract the current season integer from a ZenGM export.
-
-    ZenGM exports ``gameAttributes`` in two formats:
+    Read a single key from gameAttributes, handling both export formats:
     - List of ``{"key": ..., "value": ...}`` objects (most exports).
     - Plain dict ``{"season": 2024, ...}`` (some simplified exports).
-
-    Returns 0 if the season cannot be determined; the caller falls back to
-    a neutral age of 27 in that case.
     """
     ga = data.get("gameAttributes", [])
     if isinstance(ga, list):
         for item in ga:
-            if isinstance(item, dict) and item.get("key") == "season":
-                return int(item["value"])
+            if isinstance(item, dict) and item.get("key") == key:
+                return item["value"]
     elif isinstance(ga, dict):
-        if "season" in ga:
-            return int(ga["season"])
-    return 0
+        if key in ga:
+            return ga[key]
+    return default
+
+
+def _read_season(data: dict) -> int:
+    """Return the current season integer, or 0 if absent."""
+    val = _read_game_attr(data, "season", 0)
+    return int(val) if val else 0
+
+
+def _read_cap_info(data: dict) -> dict:
+    """
+    Extract salary-cap settings from a ZenGM export.
+
+    Returns a dict with:
+        salary_cap          : cap in $K (default 90 000 = $90 M)
+        salary_cap_type     : "soft", "hard", or "none" (default "soft")
+        soft_cap_trade_match: fraction for the 125 % rule (default 1.25)
+    """
+    salary_cap = float(_read_game_attr(data, "salaryCap", 90_000))
+    salary_cap_type = str(_read_game_attr(data, "salaryCapType", "soft"))
+    # ZenGM stores softCapTradeSalaryMatch as a percentage (e.g. 125 → 1.25)
+    pct_raw = float(_read_game_attr(data, "softCapTradeSalaryMatch", 125))
+    soft_cap_match = pct_raw / 100.0 if pct_raw > 1.0 else pct_raw
+    return {
+        "salary_cap":          salary_cap,
+        "salary_cap_type":     salary_cap_type,
+        "soft_cap_trade_match": soft_cap_match,
+    }
 
 
 def _parse_player(player: dict, current_season: int) -> Optional[dict]:
@@ -167,7 +189,7 @@ def parse_league_json(
 
     Returns
     -------
-    (my_roster_df, league_rosters_dict)
+    (my_roster_df, league_rosters_dict, cap_info)
 
     my_roster_df
         DataFrame of my team's active players, with columns::
@@ -194,6 +216,7 @@ def parse_league_json(
         data = json.load(fh)
 
     current_season = _read_season(data)
+    cap_info       = _read_cap_info(data)
 
     # Build tid → abbreviation lookup from the teams list
     team_label: dict[int, str] = {}
@@ -234,4 +257,4 @@ def parse_league_json(
             pd.DataFrame(rows)[OUTPUT_COLUMNS].reset_index(drop=True)
         )
 
-    return my_roster_df, league_rosters_dict
+    return my_roster_df, league_rosters_dict, cap_info

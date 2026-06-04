@@ -32,7 +32,7 @@ import pandas as pd
 
 from .formulas import BASE_RATINGS
 from .market_scanner import find_best_trades, _fast_optimize, _build_cache, _compute_team_j
-from .ai_trade_value import league_value_stats, SALARY_CAP_DEFAULT
+from .ai_trade_value import league_value_stats, player_base_value, SALARY_CAP_DEFAULT
 from .trade_engine import SALARY_SCALE
 
 # ---------------------------------------------------------------------------
@@ -50,6 +50,14 @@ TOP_N_DEFAULT: int = 5
 
 GAMES_LOCKOUT: int = 82
 """gamesUntilTradable stamped on newly acquired players to prevent immediate re-trade."""
+
+MIN_STEP_J_GAIN: float = 1.0
+"""Minimum improvement in J required for a single trade step to be kept.
+Filters out near-zero moves that appear favourable only due to floating-point
+noise in the lineup scorer."""
+
+MIN_TOTAL_J_GAIN: float = 1.0
+"""Minimum total J improvement across an entire sequence for it to be returned."""
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +209,24 @@ def _apply_trade_to_league(
     return new_dict
 
 
+def _step_roster_value_gain(
+    incoming: list[dict],
+    outgoing: list[dict],
+    league: dict,
+) -> float:
+    """
+    Net change in age-adjusted roster value (sum of player_base_value) for one
+    trade step.  Positive → we gain value; negative → we lose value.
+
+    player_base_value blends current OVR with potential weighted by age, so
+    trading a young high-pot player for an older equal-OVR player is penalised
+    even if the immediate lineup score is unchanged.
+    """
+    in_val  = sum(player_base_value(p, league) for p in incoming)
+    out_val = sum(player_base_value(p, league) for p in outgoing)
+    return in_val - out_val
+
+
 # ---------------------------------------------------------------------------
 # Beam node (internal)
 # ---------------------------------------------------------------------------
@@ -239,6 +265,8 @@ def beam_search(
     salary_cap:           float = SALARY_CAP_DEFAULT,
     salary_scale:         float = SALARY_SCALE,
     lockout_games:        int   = GAMES_LOCKOUT,
+    min_step_j_gain:      float = MIN_STEP_J_GAIN,
+    min_total_j_gain:     float = MIN_TOTAL_J_GAIN,
 ) -> list[SearchResult]:
     """
     Depth-limited beam search over trade sequences.
@@ -324,6 +352,20 @@ def beam_search(
 
                 new_j = _compute_j(new_roster)
 
+                # Guardrail A: require a meaningful per-step J gain
+                if new_j - node.j_score < min_step_j_gain:
+                    continue
+
+                # Guardrail B: reject steps that decrease age-adjusted roster value.
+                # player_base_value blends OVR with potential weighted by age, so
+                # trading a young high-pot player for an older same-OVR player
+                # produces a negative gain and is blocked here.
+                rv_gain = _step_roster_value_gain(
+                    trade["incoming"], trade["outgoing"], league
+                )
+                if rv_gain < 0:
+                    continue
+
                 step = TradeStep(
                     team=trade["team"],
                     trade_type=trade["trade_type"],
@@ -376,5 +418,7 @@ def beam_search(
         diverse = sorted(_groups.values(), key=lambda n: n.j_score, reverse=True)
         beam = diverse[:beam_width]
 
+    # Drop sequences whose total gain is below the minimum threshold
+    all_results = [r for r in all_results if r.total_j_gain >= min_total_j_gain]
     all_results.sort(key=lambda r: r.j_final, reverse=True)
     return all_results[:top_n]

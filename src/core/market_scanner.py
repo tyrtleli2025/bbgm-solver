@@ -48,6 +48,7 @@ from .ai_trade_value import (
     salary_match_ok as _salary_match_ok,
     is_untradable as _is_untradable,
     SALARY_CAP_DEFAULT as _SALARY_CAP,
+    SOFT_CAP_MATCH_PCT as _SOFT_CAP_MATCH_PCT,
 )
 
 # ---------------------------------------------------------------------------
@@ -265,8 +266,10 @@ def find_best_trades(
             is_offseason=False,
         )
 
-    current_season = int(league.get("current_season", 0))
-    is_offseason   = bool(league.get("is_offseason", False))
+    current_season   = int(league.get("current_season", 0))
+    is_offseason     = bool(league.get("is_offseason", False))
+    sal_cap_type     = str(league.get("salary_cap_type", "soft"))
+    sal_match_pct    = float(league.get("soft_cap_trade_match", _SOFT_CAP_MATCH_PCT))
     n_mine = len(my_roster_df)
 
     # --- One-time precomputation for my roster --------------------------------
@@ -312,13 +315,15 @@ def find_best_trades(
 
                 # Gate 1a: salary match — THEIR team absorbing my player
                 if not _salary_match_ok(
-                    their_sal, my_sal, their_total_sal, salary_cap
+                    their_sal, my_sal, their_total_sal, salary_cap,
+                    sal_cap_type, sal_match_pct
                 ):
                     continue
 
                 # Gate 1b: salary match — MY team absorbing their player
                 if not _salary_match_ok(
-                    my_sal, their_sal, my_total_salary, salary_cap
+                    my_sal, their_sal, my_total_salary, salary_cap,
+                    sal_cap_type, sal_match_pct
                 ):
                     continue
 

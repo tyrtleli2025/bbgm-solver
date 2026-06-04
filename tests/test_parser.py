@@ -79,9 +79,11 @@ def _make_export(*players, teams=None, season=_CURRENT_SEASON) -> dict:
 
 
 def _write_and_parse(tmp_path, export: dict, my_tid: int = 0):
+    """Return (my_df, league_dict) — cap_info dropped for backwards compat."""
     f = tmp_path / "league.json"
     f.write_text(json.dumps(export))
-    return parse_league_json(f, my_tid=my_tid)
+    my_df, league_dict, _cap = parse_league_json(f, my_tid=my_tid)
+    return my_df, league_dict
 
 
 # ---------------------------------------------------------------------------
@@ -115,9 +117,22 @@ def full_export():
 
 class TestOutputStructure:
 
-    def test_returns_tuple_of_two(self, tmp_path, full_export):
-        result = _write_and_parse(tmp_path, full_export)
-        assert isinstance(result, tuple) and len(result) == 2
+    def test_returns_tuple_of_three(self, tmp_path, full_export):
+        """parse_league_json returns (my_df, league_dict, cap_info)."""
+        f = tmp_path / "league.json"
+        f.write_text(json.dumps(full_export))
+        result = parse_league_json(f)
+        assert isinstance(result, tuple) and len(result) == 3
+
+    def test_cap_info_has_required_keys(self, tmp_path, full_export):
+        f = tmp_path / "league.json"
+        f.write_text(json.dumps(full_export))
+        _, _, cap_info = parse_league_json(f)
+        for key in ("salary_cap", "salary_cap_type", "soft_cap_trade_match"):
+            assert key in cap_info, f"Missing cap_info key: {key}"
+        assert cap_info["salary_cap"] > 0
+        assert cap_info["salary_cap_type"] in ("soft", "hard", "none")
+        assert 1.0 <= cap_info["soft_cap_trade_match"] <= 2.0
 
     def test_my_roster_is_dataframe(self, tmp_path, full_export):
         my_df, _ = _write_and_parse(tmp_path, full_export)
@@ -362,7 +377,7 @@ class TestSeasonAndAge:
         }
         f = tmp_path / "league.json"
         f.write_text(json.dumps(export))
-        my_df, _ = parse_league_json(f)
+        my_df, _, _ = parse_league_json(f)
         assert my_df.iloc[0]["age"] == pytest.approx(2025 - 1995)
 
     def test_missing_season_defaults_age_to_27(self, tmp_path):
@@ -374,7 +389,7 @@ class TestSeasonAndAge:
         }
         f = tmp_path / "league.json"
         f.write_text(json.dumps(export))
-        my_df, _ = parse_league_json(f)
+        my_df, _, _ = parse_league_json(f)
         assert my_df.iloc[0]["age"] == pytest.approx(27.0)
 
     def test_zero_salary_when_contract_absent(self, tmp_path):
@@ -392,7 +407,7 @@ class TestSeasonAndAge:
         }
         f = tmp_path / "league.json"
         f.write_text(json.dumps(export))
-        my_df, _ = parse_league_json(f)
+        my_df, _, _ = parse_league_json(f)
         assert my_df.iloc[0]["salary"] == pytest.approx(0.0)
 
     def test_file_not_found_raises(self, tmp_path):

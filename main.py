@@ -16,6 +16,7 @@ import argparse
 import sys
 import textwrap
 
+from src.core.ai_trade_value import league_value_stats
 from src.core.formulas import player_ovr
 from src.core.market_scanner import find_best_trades
 from src.core.optimizer import optimize_rotation
@@ -241,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── 1. Parse ─────────────────────────────────────────────────────────────
     print(f"\nLoading {args.file} …", end=" ", flush=True)
     try:
-        my_roster_df, league_rosters_dict = parse_league_json(
+        my_roster_df, league_rosters_dict, cap_info = parse_league_json(
             args.file, my_tid=args.tid
         )
     except FileNotFoundError:
@@ -258,11 +259,20 @@ def main(argv: list[str] | None = None) -> int:
     n_others = sum(len(df) for df in league_rosters_dict.values())
     print(f"done.")
 
-    # Try to infer a team label from the league dict (our team won't be in it)
-    my_label = f"tid={args.tid}"
+    # Build a shared League dict containing real cap settings from the export
+    _all_rosters = {"__mine__": my_roster_df, **league_rosters_dict}
+    league = league_value_stats(
+        _all_rosters,
+        salary_cap=cap_info["salary_cap"],
+        salary_cap_type=cap_info["salary_cap_type"],
+        soft_cap_trade_match=cap_info["soft_cap_trade_match"],
+    )
 
-    # If the JSON has a season we can show it; read from the DataFrame if possible
-    # (parser doesn't return season, so we just skip it gracefully)
+    print(
+        f"  Cap: ${cap_info['salary_cap']/1000:.1f} M  "
+        f"type={cap_info['salary_cap_type']}  "
+        f"trade-match={cap_info['soft_cap_trade_match']*100:.0f} %"
+    )
     print(
         f"  My roster  : {n_my} active players\n"
         f"  Opponents  : {n_teams} teams  ({n_others} players)\n"
@@ -305,6 +315,8 @@ def main(argv: list[str] | None = None) -> int:
     trades = find_best_trades(
         my_roster_df,
         league_rosters_dict,
+        league=league,
+        salary_cap=cap_info["salary_cap"],
         top_n=args.top,
         progress=_on_progress,
     )
@@ -328,6 +340,8 @@ def main(argv: list[str] | None = None) -> int:
         sequences = beam_search(
             my_roster_df,
             league_rosters_dict,
+            league=league,
+            salary_cap=cap_info["salary_cap"],
             depth=args.depth,
             beam_width=args.beam,
             top_n=args.top,

@@ -210,6 +210,8 @@ def league_value_stats(
     current_season: int = 0,
     is_offseason: bool = False,
     salary_cap: float = SALARY_CAP_DEFAULT,
+    salary_cap_type: str = "soft",
+    soft_cap_trade_match: float = SOFT_CAP_MATCH_PCT,
 ) -> League:
     """
     Compute league-wide OVR statistics needed for z-scoring.
@@ -220,15 +222,18 @@ def league_value_stats(
 
     Parameters
     ----------
-    all_rosters   : {team_name: roster_df} for every team.
-    current_season: season number (for contract-expiry detection).
-    is_offseason  : whether it is the offseason (affects expiry detection).
-    salary_cap    : salary cap in raw salary-column units (default $90 M in $K).
+    all_rosters          : {team_name: roster_df} for every team.
+    current_season       : season number (for contract-expiry detection).
+    is_offseason         : whether it is the offseason (affects expiry).
+    salary_cap           : cap in raw salary-column units (default $90 M/$K).
+    salary_cap_type      : "soft", "hard", or "none" (default "soft").
+    soft_cap_trade_match : fraction for 125 % soft-cap rule (default 1.25).
 
     Returns
     -------
     League dict with keys: ovr_mean, ovr_std,
-    salary_cap, current_season, is_offseason.
+    salary_cap, salary_cap_type, soft_cap_trade_match,
+    current_season, is_offseason.
     """
     all_players = [
         df.iloc[i]
@@ -240,6 +245,8 @@ def league_value_stats(
         return dict(
             ovr_mean=47.0, ovr_std=10.0,
             salary_cap=salary_cap,
+            salary_cap_type=salary_cap_type,
+            soft_cap_trade_match=soft_cap_trade_match,
             current_season=current_season,
             is_offseason=is_offseason,
         )
@@ -251,6 +258,8 @@ def league_value_stats(
     return dict(
         ovr_mean=ovr_mean, ovr_std=ovr_std,
         salary_cap=salary_cap,
+        salary_cap_type=salary_cap_type,
+        soft_cap_trade_match=soft_cap_trade_match,
         current_season=current_season,
         is_offseason=is_offseason,
     )
@@ -501,25 +510,34 @@ def salary_match_ok(
     our_total_salary: float,
     salary_cap: float,
     salary_cap_type: str = "soft",
+    soft_cap_match_pct: float = SOFT_CAP_MATCH_PCT,
 ) -> bool:
     """
     Check whether the salary-matching constraint passes (§ 10).
 
-    soft  — if over the cap, incoming ≤ SOFT_CAP_MATCH_PCT × outgoing (125 %).
-    hard  — trade cannot push total payroll over the cap.
-    none  — no salary constraint.
+    Over-cap status is determined by the **post-trade** payroll (ZenGM rule):
+        new_payroll = our_total − outgoing + incoming
+
+    hard — new_payroll must not exceed the cap.
+    soft — if new_payroll ≤ cap: allowed;
+            elif outgoing ≤ 0: blocked (absorbing salary while going over cap);
+            else: incoming ≤ outgoing × soft_cap_match_pct.
+    none — no constraint.
     """
     if salary_cap_type == "none":
         return True
+
+    new_payroll = our_total_salary - outgoing_salary + incoming_salary
+
     if salary_cap_type == "hard":
-        new_payroll = our_total_salary - outgoing_salary + incoming_salary
         return new_payroll <= salary_cap
-    # soft cap
-    if our_total_salary <= salary_cap:
-        return True   # under cap: no restriction
+
+    # soft cap — use post-trade payroll to determine over-cap status
+    if new_payroll <= salary_cap:
+        return True   # trade keeps/brings us under the cap
     if outgoing_salary <= 0:
-        return incoming_salary <= 0
-    return incoming_salary <= outgoing_salary * SOFT_CAP_MATCH_PCT
+        return False  # absorbing salary while pushing over cap with nothing outgoing
+    return incoming_salary <= outgoing_salary * soft_cap_match_pct
 
 
 def is_untradable(

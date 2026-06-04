@@ -27,6 +27,7 @@ from src.core.ai_trade_value import (
     infer_strategy,
     SALARY_CAP_DEFAULT,
 )
+from src.core.ai_trade_value import player_base_value
 from src.core.trade_search import (
     beam_search,
     SearchResult,
@@ -34,6 +35,8 @@ from src.core.trade_search import (
     BEAM_WIDTH_DEFAULT,
     DEPTH_DEFAULT,
     GAMES_LOCKOUT,
+    MIN_STEP_J_GAIN,
+    MIN_TOTAL_J_GAIN,
 )
 
 SEASON     = 2024
@@ -549,3 +552,109 @@ class TestNewInvariants:
             f"Expected ≥2 distinct acquired players (diversity grouping active), "
             f"got: {acquired_pids}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. Noise-churn fixes: MIN_STEP_J_GAIN and asset-value guardrail
+# ---------------------------------------------------------------------------
+
+
+class TestNoiseFixes:
+
+    def test_min_step_j_gain_filters_trivial_moves(self):
+        """
+        Sequences whose per-step J gain is below MIN_STEP_J_GAIN must be
+        dropped.  Passing a very high threshold forces all steps to be filtered.
+        """
+        my, alpha, _ = _two_step_scenario()
+        lg = _make_league(my, alpha)
+
+        # With a huge threshold every trade is below it → empty results
+        results_strict = beam_search(
+            my, {"A": alpha}, league=lg, depth=1, beam_width=5,
+            min_step_j_gain=10_000.0,
+        )
+        assert results_strict == [], (
+            "All trades should be filtered with an impossibly high step gain threshold"
+        )
+
+        # With threshold=0, the same scenario should produce results
+        results_loose = beam_search(
+            my, {"A": alpha}, league=lg, depth=1, beam_width=5,
+            min_step_j_gain=0.0, min_total_j_gain=0.0,
+        )
+        assert len(results_loose) > 0, (
+            "Trades should appear when min_step_j_gain=0"
+        )
+
+    def test_min_total_j_gain_filters_weak_sequences(self):
+        """Sequences with total J gain below min_total_j_gain are excluded."""
+        my, alpha, _ = _two_step_scenario()
+        lg = _make_league(my, alpha)
+
+        results = beam_search(
+            my, {"A": alpha}, league=lg, depth=1, beam_width=5,
+            min_total_j_gain=10_000.0,
+        )
+        assert results == []
+
+    def test_asset_value_guardrail_rejects_age_regression(self):
+        """
+        Trading a young high-pot player for an older same-OVR player must be
+        blocked by the asset-value guardrail even if J improves slightly.
+
+        Setup:
+          My player  : age=21, rating=68, pot=90  → high player_base_value
+                       (young players are weighted toward pot via age table)
+          Their player: age=35, rating=72, pot=72  → lower player_base_value
+                        (35-year-olds use only 0.91 × current OVR)
+
+        J might improve because OVR_their > OVR_mine.  But
+        player_base_value(mine) > player_base_value(theirs), so the step
+        has negative rv_gain → blocked.
+        """
+        # Background league provides realistic ovr_mean/std
+        bg_lg = _make_league()
+
+        my_young = _p(1, rating=68, age=21.0, pot=90, salary=0)
+        their_old = _p(21, rating=72, age=35.0, pot=72, salary=0)
+
+        # Verify the guardrail criterion holds for this player pair
+        bv_mine   = player_base_value(my_young,  bg_lg)
+        bv_theirs = player_base_value(their_old, bg_lg)
+        assert bv_mine > bv_theirs, (
+            f"Test setup: young player base value ({bv_mine:.2f}) should exceed "
+            f"old player ({bv_theirs:.2f})"
+        )
+
+        fill = [_p(10 + i, rating=65) for i in range(5)]
+        my_roster   = _roster(my_young,  *fill)
+        their_roster = _roster(their_old, *[_p(22 + i, rating=60) for i in range(6)])
+
+        results = beam_search(
+            my_roster,
+            {"OldTeam": their_roster},
+            league=bg_lg,
+            depth=1,
+            beam_width=10,
+            min_step_j_gain=0.0,   # disable J-gain filter to isolate rv guardrail
+            min_total_j_gain=0.0,
+        )
+
+        # No result should trade away my_young (pid=1) and receive their_old (pid=21)
+        for r in results:
+            for step in r.sequence:
+                out_pids = {
+                    int(float(p.get("pid", -1)))
+                    for p in step.outgoing
+                    if p.get("pid") is not None
+                }
+                in_pids = {
+                    int(float(p.get("pid", -1)))
+                    for p in step.incoming
+                    if p.get("pid") is not None
+                }
+                assert not (1 in out_pids and 21 in in_pids), (
+                    "Asset-value guardrail failed: traded young (pid=1) "
+                    "for older equal-OVR player (pid=21)"
+                )
