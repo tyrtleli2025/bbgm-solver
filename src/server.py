@@ -49,7 +49,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 from src.core.ai_trade_value import league_value_stats
-from src.core.market_scanner import find_best_trades
+from src.core.market_scanner import find_best_trades, _build_cache, _compute_team_j
+from src.core.optimizer import optimize_rotation
 from src.core.parser import parse_league_data
 from src.core.trade_search import beam_search
 
@@ -106,16 +107,53 @@ try{
 })()"""
 
 
-def make_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str:
-    """Return the full `javascript:...` URL with the given port and scheme substituted."""
-    # Minify: collapse indentation / newlines, substitute port and scheme
-    body = BOOKMARKLET_BODY.replace("\n", "").replace("PORT", str(port))
-    # Replace http:// with the correct scheme (http or https)
-    body = body.replace("http://localhost", f"{scheme}://localhost")
-    # Collapse multiple spaces that appear after removing newlines
+# Second bookmarklet — team strength evaluator (POSTs to /evaluate)
+BOOKMARKLET_EVAL_BODY: str = """\
+(async()=>{
+const m=location.pathname.match(/\\/l\\/(\\d+)/);
+if(!m)return alert('Open a ZenGM league page first');
+const lid=m[1],tid=+(prompt('Your team ID?','0')||0);
+const db=await new Promise((r,j)=>{
+  const o=indexedDB.open('league'+lid);
+  o.onsuccess=e=>r(e.target.result);o.onerror=j});
+const A=s=>new Promise((r,j)=>{
+  const q=db.transaction(s,'readonly').objectStore(s).getAll();
+  q.onsuccess=e=>r(e.target.result);q.onerror=j});
+const[pl,ga]=await Promise.all([A('players'),A('gameAttributes')]);
+const tm=await A('teams').catch(()=>[]);
+const body=JSON.stringify({players:pl,gameAttributes:ga,teams:tm,tid});
+try{
+  const d=await(await fetch('http://localhost:PORT/evaluate',{
+    method:'POST',headers:{'Content-Type':'application/json'},body})).json();
+  const rank=d.my_rank,tot=d.total_teams,gap=d.gap_to_top;
+  const medal=rank===1?'🏆':rank<=3?'🥇 contender':'⚠ not yet';
+  const top5=(d.rankings||[]).slice(0,5).map((t,i)=>
+    `${i+1}${t.is_mine?' ▶':'.  '} ${t.team.padEnd(6)} J=${t.j.toFixed(1)}`).join('\\n');
+  const syn=d.my_synergy;
+  alert(`${medal}\\nRank: ${rank}/${tot}  Gap to #1: ${gap>0?'+':''}${(-gap).toFixed(1)}J\\n\\nSynergy — Off:${syn.off.toFixed(3)} Def:${syn.def.toFixed(3)} Reb:${syn.reb.toFixed(3)}\\n\\nTop 5 teams:\\n${top5}\\n\\nYour lineup:\\n${(d.my_lineup||[]).join(', ')}`)
+}catch(e){
+  navigator.clipboard.writeText(body)
+    .then(()=>alert('Blocked. Payload copied.\\nRun: python main.py --serve\\nError: '+e.message))
+    .catch(()=>alert('Error: '+e.message))
+}
+})()"""
+
+
+def _minify_bm(raw: str, port: int, scheme: str) -> str:
     import re
-    body = re.sub(r"  +", " ", body)
-    return f"javascript:{body}"
+    body = raw.replace("\n", "").replace("PORT", str(port))
+    body = body.replace("http://localhost", f"{scheme}://localhost")
+    return f"javascript:{re.sub(r'  +', ' ', body)}"
+
+
+def make_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str:
+    """Return the trade-finder `javascript:` URL."""
+    return _minify_bm(BOOKMARKLET_BODY, port, scheme)
+
+
+def make_eval_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str:
+    """Return the team-strength-evaluator `javascript:` URL."""
+    return _minify_bm(BOOKMARKLET_EVAL_BODY, port, scheme)
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +275,62 @@ def solve(payload: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Team strength evaluator
+# ---------------------------------------------------------------------------
+
+
+def evaluate(payload: dict) -> dict:
+    """
+    Rank all teams in the league by lineup strength and return my team's
+    position, synergy breakdown, and championship contention status.
+    """
+    my_tid = int(payload.get("tid", 0))
+    my_roster_df, league_rosters_dict, cap_info = parse_league_data(
+        payload, my_tid=my_tid
+    )
+
+    def _team_j(df):
+        caches = [_build_cache(df.iloc[i]) for i in range(len(df))]
+        return _compute_team_j(caches)
+
+    # My team
+    my_j       = _team_j(my_roster_df)
+    my_detail  = optimize_rotation(my_roster_df)
+    my_syn     = my_detail["synergy"]
+    my_lineup  = [
+        str(my_detail["lineup"].iloc[i].get("name") or f"pid_{my_detail['lineup'].iloc[i].get('pid','?')}")
+        for i in range(len(my_detail["lineup"]))
+    ]
+
+    # All opponent teams
+    rankings = []
+    for team_name, their_df in league_rosters_dict.items():
+        if len(their_df) < 5:
+            continue
+        rankings.append({"team": team_name, "j": _team_j(their_df), "is_mine": False})
+
+    rankings.append({"team": "YOUR TEAM", "j": my_j, "is_mine": True})
+    rankings.sort(key=lambda x: x["j"], reverse=True)
+
+    my_rank   = next(i + 1 for i, t in enumerate(rankings) if t["is_mine"])
+    top_j     = rankings[0]["j"]
+    gap       = my_j - top_j   # negative = behind leader
+
+    log.info("Evaluate: rank %d/%d  J=%.1f  gap=%.1f", my_rank, len(rankings), my_j, gap)
+
+    return {
+        "my_rank":     my_rank,
+        "total_teams": len(rankings),
+        "my_j":        my_j,
+        "top_j":       top_j,
+        "gap_to_top":  gap,
+        "my_synergy":  {"off": my_syn["off"], "def": my_syn["def"], "reb": my_syn["reb"]},
+        "my_lineup":   my_lineup,
+        "rankings":    rankings,
+    }
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -254,19 +348,20 @@ class SolverHandler(BaseHTTPRequestHandler):
         self._send(200, {})
 
     def do_POST(self) -> None:
-        if self.path.rstrip("/") != "/solve":
-            self._send(404, {"error": "only POST /solve is supported"})
+        path = self.path.rstrip("/")
+        if path not in ("/solve", "/evaluate"):
+            self._send(404, {"error": "endpoints: POST /solve  POST /evaluate"})
             return
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            body   = self.rfile.read(length)
+            length  = int(self.headers.get("Content-Length", 0))
+            body    = self.rfile.read(length)
             payload = json.loads(body)
-            result  = solve(payload)
+            result  = solve(payload) if path == "/solve" else evaluate(payload)
             self._send(200, result)
         except ValueError as exc:
             self._send(400, {"error": str(exc)})
         except Exception as exc:
-            log.exception("Solver error")
+            log.exception("Server error on %s", path)
             self._send(500, {"error": str(exc)})
 
     def _send(self, code: int, body: dict) -> None:
@@ -321,17 +416,22 @@ def start_server(
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
 
-    bm = make_bookmarklet(port, scheme=scheme)
+    bm      = make_bookmarklet(port, scheme=scheme)
+    bm_eval = make_eval_bookmarklet(port, scheme=scheme)
     print()
     print("=" * 70)
-    print(f"  BBGM Solver server running at {scheme}://localhost:{port}/solve")
+    print(f"  BBGM Solver server  —  {scheme}://localhost:{port}")
     print("=" * 70)
     print()
-    print("── BOOKMARKLET ─────────────────────────────────────────────────────")
-    print("  Copy the line below (starts with 'javascript:') and save it as a")
-    print("  new browser bookmark.  Then click it while on any ZenGM league page.")
+    print("── BOOKMARKLET 1: Trade Finder ──────────────────────────────────────")
+    print("  Save as a bookmark, click on any ZenGM league page.")
     print()
     print(bm)
+    print()
+    print("── BOOKMARKLET 2: Team Strength / Championship Readiness ────────────")
+    print("  Ranks all teams by lineup strength; shows your synergy breakdown.")
+    print()
+    print(bm_eval)
     print()
     print("── NOTES ───────────────────────────────────────────────────────────")
     if scheme == "http":
