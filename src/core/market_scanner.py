@@ -1,40 +1,38 @@
 """
 Trade Market Scanner — Phase 3.
 
-Scans every team in the league and evaluates all 1-for-1 and 2-for-1 trade
-combinations (from our perspective: we send 1 or 2 players, we receive 1).
+A trade is considered in two independent stages:
 
-Performance design
-------------------
-The naive approach calls optimize_rotation() twice per candidate trade
-(once for the old roster, once for the new roster).  With 6 500+ candidates
-across a full 30-team league, that totals ~2 hours.
+  PLAUSIBLE  — the opposing AI team's value-change (dv) is strictly positive,
+               the salary-matching constraint holds, and no untradable players
+               are involved.  This uses ZenGM's full ValueChangeCalculator
+               (ai_trade_value.evaluate_dv) as the acceptance gate.
 
-Two optimisations close this gap to ~10 seconds:
+  DESIRABLE  — the trade raises MY optimal lineup score J, computed via the
+               fast _PlayerCache / _fast_optimize path (unchanged from before).
 
-  1. Precompute old lineup score once.
-     optimize_rotation(my_roster_df) is always the same call.  Computing it
-     once instead of once-per-trade halves the work.
+Only trades that pass BOTH gates are returned.  There is no symmetric delta-
+window (ASSET_FLOOR / MAX_AI_LOSS) — the AI acceptance formula is the sole
+realism filter.
 
-  2. Precompute per-player sigmoid contributions (_PlayerCache).
-     The inner loop of optimize_rotation calls composite_rating for each
-     of (5 players × 8 composites) per lineup combination, and each
-     composite_rating does 15 pandas .get() lookups.  For C(15,5)=3 003
-     combos that is ~1.8 M pandas operations per optimizer call.
+For each (team, target player) pair the scanner assembles the minimal package
+of my tradeable assets that satisfies dv > 0.  Package sizes supported: 1-for-1
+and 2-for-1 (we send 2, we receive 1).
 
-     Instead, precompute each player's 8 skill-sigmoid values once as a
-     numpy array.  Scoring a lineup then needs only 4 numpy array additions
-     (8-element vectors) plus 13 scalar sigmoid calls — no pandas overhead.
-
-     Measured speedup on a 15-player roster: ~40× per lineup evaluation,
-     making each optimizer call ~15 ms instead of ~630 ms.
+Performance notes
+-----------------
+• Per-player sigmoid contributions (_PlayerCache) are precomputed once, making
+  each C(n,5) inner loop iteration ~40× faster than calling composite_rating.
+• evaluate_dv is cheap (a few dozen Python ops per player pair) so the dv check
+  runs before the more expensive _fast_optimize call.
+• The old lineup score is precomputed once and reused for every trade.
 """
 
 from __future__ import annotations
 
 import itertools
 import math
-from typing import Callable
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -42,36 +40,29 @@ import pandas as pd
 from .formulas import composite_rating, player_ovr
 from .optimizer import OFF_WEIGHT, DEF_WEIGHT
 from .synergy import _SKILL_A, _SKILL_PARAMS, sigmoid
-from .trade_engine import SALARY_SCALE, calculate_asset_value
+from .trade_engine import SALARY_SCALE
+from .ai_trade_value import (
+    evaluate_dv as _evaluate_dv,
+    league_value_stats as _league_value_stats,
+    infer_strategy as _infer_strategy,
+    salary_match_ok as _salary_match_ok,
+    is_untradable as _is_untradable,
+    SALARY_CAP_DEFAULT as _SALARY_CAP,
+)
 
 # ---------------------------------------------------------------------------
-# Defaults (module-level so tests can reference them)
+# Public constants
 # ---------------------------------------------------------------------------
-
-ASSET_FLOOR_DEFAULT: float = -5.0
-"""Minimum acceptable net_asset_value.  Trades costing more than this
-in asset value are pre-filtered before the optimizer is invoked."""
-
-MAX_AI_LOSS: float = 3.0
-"""Maximum asset value the opposing team is allowed to lose in a trade.
-A trade where delta = their_outgoing_value - our_outgoing_value > MAX_AI_LOSS
-means we are gaining too much value for a realistic AI counterpart to accept.
-Discarding such trades removes unrealistic lopsided recommendations.
-Combined with ASSET_FLOOR_DEFAULT this creates a fair-trade window:
-    ASSET_FLOOR_DEFAULT ≤ net_asset_value ≤ MAX_AI_LOSS"""
 
 TOP_N_DEFAULT: int = 5
 """Maximum number of results returned by find_best_trades."""
 
 # ---------------------------------------------------------------------------
-# Per-player cache
+# Per-player cache  (unchanged — fast lineup scorer)
 # ---------------------------------------------------------------------------
 
-# Canonical skill-tag ordering  — index into _PlayerCache.sigs
 _SKILL_TAGS: tuple[str, ...] = tuple(_SKILL_PARAMS.keys())
-# ("3", "A", "B", "Di", "Dp", "Po", "Ps", "R")
 
-# Fixed indices for zero-overhead extraction in the inlined synergy formula
 _I3  = _SKILL_TAGS.index("3")
 _IA  = _SKILL_TAGS.index("A")
 _IB  = _SKILL_TAGS.index("B")
@@ -79,17 +70,10 @@ _IDi = _SKILL_TAGS.index("Di")
 _IDp = _SKILL_TAGS.index("Dp")
 _IPo = _SKILL_TAGS.index("Po")
 _IPs = _SKILL_TAGS.index("Ps")
-# "R" (rebounding) is excluded from the lineup scorer (not in OFF/DEF weights)
 
 
 class _PlayerCache:
-    """
-    Precomputed per-player values for fast lineup scoring.
-
-    sigs : numpy array of shape (8,) — sigmoid(composite_rating(player,
-           composite), 15, cutoff) for each of the 8 skill tags, in
-           _SKILL_TAGS order.
-    """
+    """Precomputed per-player values for fast lineup scoring."""
     __slots__ = ("ovr", "sigs")
 
     def __init__(self, ovr: int, sigs: np.ndarray) -> None:
@@ -98,7 +82,6 @@ class _PlayerCache:
 
 
 def _build_cache(player) -> _PlayerCache:
-    """Build a _PlayerCache from a player dict or pd.Series.  Called once per player."""
     return _PlayerCache(
         ovr=player_ovr(player),
         sigs=np.array([
@@ -109,24 +92,15 @@ def _build_cache(player) -> _PlayerCache:
 
 
 # ---------------------------------------------------------------------------
-# Fast lineup scorer
+# Fast lineup scorer  (unchanged)
 # ---------------------------------------------------------------------------
 
 
 def _fast_score(c0: _PlayerCache, c1: _PlayerCache, c2: _PlayerCache,
                 c3: _PlayerCache, c4: _PlayerCache) -> float:
-    """
-    Score a 5-player lineup using precomputed caches.
-
-    Numerically equivalent to lineup_score([p0..p4])["score"] but avoids all
-    composite_rating / pandas .get() calls inside the hot loop.
-    """
     ovr_sum = c0.ovr + c1.ovr + c2.ovr + c3.ovr + c4.ovr
-
-    # Sum 8-element numpy arrays — four vectorised additions
     s = c0.sigs + c1.sigs + c2.sigs + c3.sigs + c4.sigs
 
-    # --- Offensive synergy (inlined from synergy._offensive_synergy) ---
     s3  = float(s[_I3])
     sB  = float(s[_IB])
     sPs = float(s[_IPs])
@@ -144,10 +118,8 @@ def _fast_score(c0: _PlayerCache, c1: _PlayerCache, c2: _PlayerCache,
     perim = max(0.0, min(2.0, math.sqrt(1.0 + sB + sPs + s3) - 1.0)) / 2.0
     off  *= 0.5 + 0.5 * perim
 
-    # --- Defensive synergy (inlined from synergy._defensive_synergy) ---
     sDp = float(s[_IDp])
     sDi = float(s[_IDi])
-
     def_  = sigmoid(sDp, 15, 0.75)
     def_ += 2.0 * sigmoid(sDi, 15, 0.75)
     def_ += sigmoid(sA, 5, 2.00) + sigmoid(sA, 5, 3.25)
@@ -157,7 +129,7 @@ def _fast_score(c0: _PlayerCache, c1: _PlayerCache, c2: _PlayerCache,
 
 
 def _fast_optimize(caches: list[_PlayerCache]) -> float:
-    """Return the best lineup score over all C(n, 5) combinations of *caches*."""
+    """Best lineup score over all C(n, 5) combinations."""
     best = -math.inf
     for combo in itertools.combinations(caches, 5):
         score = _fast_score(*combo)
@@ -167,64 +139,25 @@ def _fast_optimize(caches: list[_PlayerCache]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Internal enumeration helpers  (kept for backwards-compat with existing tests)
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _precompute_values(
-    roster_df: pd.DataFrame, salary_scale: float
-) -> list[float]:
-    return [
-        calculate_asset_value(roster_df.iloc[i], salary_scale)
-        for i in range(len(roster_df))
-    ]
+def _get_salary(player, salary_scale: float) -> float:
+    """Extract raw salary from a player dict or pd.Series."""
+    raw = player.get("salary") if isinstance(player, dict) else player.get("salary")
+    if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+        return 0.0
+    return float(raw)
 
 
-def _enumerate_1for1(
-    n_mine: int,
-    n_theirs: int,
-    my_vals: list[float],
-    their_vals: list[float],
-    floor: float,
-    ai_loss_cap: float,
-) -> list[tuple[list[int], list[int]]]:
-    """
-    All (my_indices, their_indices) pairs for 1-for-1 that pass both value filters.
-
-    delta = their_vals[j] - my_vals[i]  (our net gain = their net loss)
-    Accepted when: floor ≤ delta ≤ ai_loss_cap
-    """
-    out = []
-    for i in range(n_mine):
-        for j in range(n_theirs):
-            delta = their_vals[j] - my_vals[i]
-            if floor <= delta <= ai_loss_cap:
-                out.append(([i], [j]))
-    return out
-
-
-def _enumerate_2for1(
-    n_mine: int,
-    n_theirs: int,
-    my_vals: list[float],
-    their_vals: list[float],
-    floor: float,
-    ai_loss_cap: float,
-) -> list[tuple[list[int], list[int]]]:
-    """
-    All (my_indices, their_indices) for 2-for-1 that pass both value filters.
-
-    delta = their_vals[j] - (my_vals[i1] + my_vals[i2])  (our net gain)
-    Accepted when: floor ≤ delta ≤ ai_loss_cap
-    """
-    out = []
-    for i1, i2 in itertools.combinations(range(n_mine), 2):
-        combined_my = my_vals[i1] + my_vals[i2]
-        for j in range(n_theirs):
-            delta = their_vals[j] - combined_my
-            if floor <= delta <= ai_loss_cap:
-                out.append(([i1, i2], [j]))
-    return out
+def _total_salary(roster_df: pd.DataFrame) -> float:
+    total = 0.0
+    for i in range(len(roster_df)):
+        raw = roster_df.iloc[i].get("salary")
+        if raw is not None and not (isinstance(raw, float) and math.isnan(raw)):
+            total += float(raw)
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -235,121 +168,190 @@ def _enumerate_2for1(
 def find_best_trades(
     my_roster_df: pd.DataFrame,
     league_rosters_dict: dict[str, pd.DataFrame],
+    league: Optional[dict] = None,
+    salary_cap: float = _SALARY_CAP,
     salary_scale: float = SALARY_SCALE,
-    asset_value_floor: float = ASSET_FLOOR_DEFAULT,
-    max_ai_loss: float = MAX_AI_LOSS,
     top_n: int = TOP_N_DEFAULT,
-    progress: Callable[[str, int, int], None] | None = None,
+    progress: Optional[Callable[[str, int, int], None]] = None,
 ) -> list[dict]:
     """
     Scan the league for the best available trades for my team.
 
-    Evaluates every 1-for-1 and 2-for-1 combination across all teams in
-    league_rosters_dict.  "2-for-1" means we send 2 players and receive 1.
-
-    Filtering (applied in this order for efficiency)
-    -------------------------------------------------
-    Let delta = their_outgoing_value − our_outgoing_value (our net asset gain).
-
-    1. Our floor   : delta ≥ asset_value_floor  (we don't give away too much).
-    2. AI cap      : delta ≤ max_ai_loss         (opposing team doesn't lose too much).
-       Together these define a realistic fair-trade window.  Candidates outside
-       the window are discarded before the expensive lineup optimizer is called.
-    3. Lineup filter: net_lineup_score > 0 after running the fast optimizer.
+    Filters
+    -------
+    1. Untradable players are excluded (gamesUntilTradable > 0 or
+       expired contract during offseason).
+    2. Salary match: the other team's post-trade salary must satisfy the
+       soft-cap 125 % rule (or hard-cap, if configured).
+    3. AI acceptance: evaluate_dv(other_team, ...) > 0 using the other team's
+       inferred strategy and ZenGM's full ValueChangeCalculator formula.
+    4. Lineup improvement: my optimal lineup score J must increase (> 0).
 
     Parameters
     ----------
-    my_roster_df        : my team's roster DataFrame (one row per player).
-    league_rosters_dict : dict mapping team name → roster DataFrame.
-    salary_scale        : passed through to calculate_asset_value (default 1 000).
-    asset_value_floor   : lower bound on net_asset_value delta (default −5.0).
-    max_ai_loss         : upper bound on net_asset_value delta (default 3.0).
-                          Trades where we gain more than this are discarded as
-                          unrealistically lopsided for the AI to accept.
+    my_roster_df        : my team's roster DataFrame.
+    league_rosters_dict : {team_name: roster_df} for every opponent.
+    league              : League dict from ai_trade_value.league_value_stats().
+                          If None, computed from all rosters automatically.
+    salary_cap          : cap in raw salary units (default $90 M in $K).
+    salary_scale        : passed through for salary context (default 1 000).
     top_n               : maximum results to return (default 5).
-    progress            : optional callable(team_name, n_done, n_total) invoked
-                          after each team is processed — use for progress bars.
+    progress            : optional callable(team_name, n_done, n_total).
 
     Returns
     -------
     list of up to top_n dicts sorted by net_lineup_score descending:
-        'team'             : str   — trade-partner key from league_rosters_dict
+        'team'             : str   — trade-partner key
         'trade_type'       : str   — '1-for-1' or '2-for-1'
         'incoming'         : list  — player dicts arriving on my roster
         'outgoing'         : list  — player dicts leaving my roster
-        'net_lineup_score' : float — improvement to my optimal lineup score (> 0)
-        'net_asset_value'  : float — change in my total asset value
-        'new_score'        : float — my new optimal lineup score after the trade
+        'net_lineup_score' : float — improvement to my optimal lineup score
+        'dv'               : float — the AI's acceptance margin (> 0)
+        'new_score'        : float — my new optimal lineup score
     """
     if len(my_roster_df) < 5:
         raise ValueError(
             f"My roster has only {len(my_roster_df)} players; at least 5 required."
         )
 
+    # Build league stats if not supplied
+    if league is None:
+        all_rosters = {"__mine__": my_roster_df, **league_rosters_dict}
+        league = _league_value_stats(
+            all_rosters,
+            salary_cap=salary_cap,
+            current_season=0,
+            is_offseason=False,
+        )
+
+    current_season = int(league.get("current_season", 0))
+    is_offseason   = bool(league.get("is_offseason", False))
     n_mine = len(my_roster_df)
 
     # --- One-time precomputation for my roster --------------------------------
-    my_vals   = _precompute_values(my_roster_df, salary_scale)
     my_caches = [_build_cache(my_roster_df.iloc[i]) for i in range(n_mine)]
-
-    # Old lineup score computed ONCE — never repeated inside the trade loop
     old_score = _fast_optimize(my_caches)
+
+    # Identify my tradeable players up front
+    my_tradeable = [
+        i for i in range(n_mine)
+        if not _is_untradable(my_roster_df.iloc[i], current_season, is_offseason)
+    ]
+    my_total_salary = _total_salary(my_roster_df)
 
     passing: list[dict] = []
     n_total = len(league_rosters_dict)
     n_done  = 0
 
-    for team_name, their_roster_df in league_rosters_dict.items():
-        if their_roster_df is None or len(their_roster_df) < 1:
+    for team_name, their_df in league_rosters_dict.items():
+        if their_df is None or len(their_df) < 1:
             n_done += 1
             if progress:
                 progress(team_name, n_done, n_total)
             continue
 
-        n_theirs = len(their_roster_df)
+        n_theirs = len(their_df)
+        their_strategy    = _infer_strategy(their_df)
+        their_caches      = [_build_cache(their_df.iloc[j]) for j in range(n_theirs)]
+        their_total_sal   = _total_salary(their_df)
 
-        # Precompute for this opponent (once per team)
-        their_vals   = _precompute_values(their_roster_df, salary_scale)
-        their_caches = [_build_cache(their_roster_df.iloc[j]) for j in range(n_theirs)]
+        their_tradeable = [
+            j for j in range(n_theirs)
+            if not _is_untradable(their_df.iloc[j], current_season, is_offseason)
+        ]
 
-        candidates: list[tuple[list[int], list[int], str]] = []
+        # ── 1-for-1 ────────────────────────────────────────────────────────
+        for j in their_tradeable:
+            their_p   = their_df.iloc[j]
+            their_sal = _get_salary(their_p, salary_scale)
 
-        for my_idx, their_idx in _enumerate_1for1(
-            n_mine, n_theirs, my_vals, their_vals, asset_value_floor, max_ai_loss
-        ):
-            candidates.append((my_idx, their_idx, "1-for-1"))
+            for i in my_tradeable:
+                my_p   = my_roster_df.iloc[i]
+                my_sal = _get_salary(my_p, salary_scale)
 
-        if n_mine >= 6:
-            for my_idx, their_idx in _enumerate_2for1(
-                n_mine, n_theirs, my_vals, their_vals, asset_value_floor, max_ai_loss
-            ):
-                candidates.append((my_idx, their_idx, "2-for-1"))
+                # Gate: salary match for the other team
+                if not _salary_match_ok(
+                    their_sal, my_sal, their_total_sal, salary_cap
+                ):
+                    continue
 
-        for my_idxs, their_idxs, trade_type in candidates:
-            if n_mine - len(my_idxs) + len(their_idxs) < 5:
-                continue
+                # Gate: AI acceptance (their dv from their perspective)
+                dv = _evaluate_dv(
+                    their_df, league,
+                    incoming=[their_p],   # what they give up
+                    outgoing=[my_p],      # what they receive
+                    strategy=their_strategy,
+                )
+                if dv <= 0:
+                    continue
 
-            # Build new roster caches: remove outgoing, append incoming
-            drop_set = set(my_idxs)
-            new_caches = [c for i, c in enumerate(my_caches) if i not in drop_set]
-            new_caches += [their_caches[j] for j in their_idxs]
+                # Gate: my lineup improvement
+                post_caches = (
+                    [c for k, c in enumerate(my_caches) if k != i]
+                    + [their_caches[j]]
+                )
+                new_score  = _fast_optimize(post_caches)
+                net_lineup = new_score - old_score
+                if net_lineup <= 0:
+                    continue
 
-            new_score  = _fast_optimize(new_caches)
-            net_lineup = new_score - old_score
+                passing.append({
+                    "team":             team_name,
+                    "trade_type":       "1-for-1",
+                    "incoming":         [their_p.to_dict()],
+                    "outgoing":         [my_p.to_dict()],
+                    "net_lineup_score": net_lineup,
+                    "dv":               dv,
+                    "new_score":        new_score,
+                })
 
-            if net_lineup <= 0:
-                continue
+        # ── 2-for-1  (we send 2, receive 1) ───────────────────────────────
+        if n_mine >= 6 and len(my_tradeable) >= 2:
+            for j in their_tradeable:
+                their_p   = their_df.iloc[j]
+                their_sal = _get_salary(their_p, salary_scale)
 
-            passing.append({
-                "team":             team_name,
-                "trade_type":       trade_type,
-                "incoming":         [their_roster_df.iloc[j].to_dict() for j in their_idxs],
-                "outgoing":         [my_roster_df.iloc[i].to_dict() for i in my_idxs],
-                "net_lineup_score": net_lineup,
-                "net_asset_value":  sum(their_vals[j] for j in their_idxs)
-                                    - sum(my_vals[i] for i in my_idxs),
-                "new_score":        new_score,
-            })
+                for i1, i2 in itertools.combinations(my_tradeable, 2):
+                    my_p1  = my_roster_df.iloc[i1]
+                    my_p2  = my_roster_df.iloc[i2]
+                    my_sal = _get_salary(my_p1, salary_scale) + _get_salary(my_p2, salary_scale)
+
+                    if not _salary_match_ok(
+                        their_sal, my_sal, their_total_sal, salary_cap
+                    ):
+                        continue
+
+                    dv = _evaluate_dv(
+                        their_df, league,
+                        incoming=[their_p],
+                        outgoing=[my_p1, my_p2],
+                        strategy=their_strategy,
+                    )
+                    if dv <= 0:
+                        continue
+
+                    drop = {i1, i2}
+                    post_caches = (
+                        [c for k, c in enumerate(my_caches) if k not in drop]
+                        + [their_caches[j]]
+                    )
+                    if len(post_caches) < 5:
+                        continue
+
+                    new_score  = _fast_optimize(post_caches)
+                    net_lineup = new_score - old_score
+                    if net_lineup <= 0:
+                        continue
+
+                    passing.append({
+                        "team":             team_name,
+                        "trade_type":       "2-for-1",
+                        "incoming":         [their_p.to_dict()],
+                        "outgoing":         [my_p1.to_dict(), my_p2.to_dict()],
+                        "net_lineup_score": net_lineup,
+                        "dv":               dv,
+                        "new_score":        new_score,
+                    })
 
         n_done += 1
         if progress:
