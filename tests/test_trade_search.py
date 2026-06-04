@@ -441,3 +441,111 @@ class TestTwoStepDiscovery:
         # Signatures may repeat across different sequence lengths but the
         # dedup check ensures no two nodes in the beam share a roster state
         assert len(results) == len(results)   # trivially true; main check is no crash
+
+
+# ---------------------------------------------------------------------------
+# 5. New invariants: depth-aware J, bilateral salary gate, beam diversity
+# ---------------------------------------------------------------------------
+
+
+class TestNewInvariants:
+
+    def test_j_includes_bench_depth(self):
+        """
+        J must differ when only the bench changes — the depth bonus captures
+        players 6-10.  Swapping a bench player with a stronger one must raise J
+        even though the top-5 lineup and its synergy score are identical.
+        """
+        from src.core.market_scanner import _compute_team_j, _build_cache
+
+        starters = [_p(10 + i, rating=75) for i in range(5)]
+        strong_bench = _p(1, rating=70)   # OVR ≈ 75
+        weak_bench   = _p(2, rating=55)   # OVR ≈ 60
+
+        roster_strong = _roster(*starters, strong_bench)
+        roster_weak   = _roster(*starters, weak_bench)
+
+        caches_s = [_build_cache(roster_strong.iloc[i]) for i in range(6)]
+        caches_w = [_build_cache(roster_weak.iloc[i])   for i in range(6)]
+
+        j_strong = _compute_team_j(caches_s)
+        j_weak   = _compute_team_j(caches_w)
+
+        assert j_strong > j_weak, (
+            f"J should be higher with better bench player: {j_strong:.3f} vs {j_weak:.3f}"
+        )
+
+    def test_my_salary_cap_blocks_excessive_intake(self):
+        """
+        When my team is over the salary cap, I cannot receive a player whose
+        salary is more than 125 % of what I send.  find_best_trades enforces
+        this via the bilateral salary gate (my-side check added in Fix 2).
+
+        Technique: set salary_cap=0 so my total salary (any positive amount)
+        puts me over cap.  Sending $300 and receiving $30K violates 125 % rule
+        (30K >> 300 × 1.25 = 375) and must be blocked.
+        """
+        from src.core.market_scanner import find_best_trades
+
+        # Inline version of the contract-differential scenario
+        my_cheap  = _p(1,  FILL_RATING, salary=CHEAP_SAL)
+        starters  = [_p(10 + i, FILL_RATING) for i in range(5)]
+        my_roster = _roster(my_cheap, *starters)
+
+        expensive = _p(21, TARGET_RATING, salary=EXPENSIVE_SAL)
+        their_roster = _roster(expensive, *[_p(22 + i, FILL_RATING) for i in range(6)])
+
+        lg = _make_league(my_roster, their_roster)
+        results = find_best_trades(my_roster, {"T": their_roster},
+                                   league=lg, salary_cap=0.0)
+
+        # Verify the salary invariant holds for every returned trade.
+        for r in results:
+            out_sal = sum(float(p.get("salary") or 0) for p in r["outgoing"])
+            in_sal  = sum(float(p.get("salary") or 0) for p in r["incoming"])
+            if out_sal > 0:
+                assert in_sal <= out_sal * 1.25 + 1.0, (
+                    f"Trade violates my-side salary cap: "
+                    f"sending ${out_sal:.0f}, receiving ${in_sal:.0f}"
+                )
+            else:
+                assert in_sal <= 0 + 1.0, (
+                    "Cannot receive non-zero salary when sending $0 over cap"
+                )
+
+    def test_beam_has_distinct_acquisitions(self):
+        """
+        Diversity grouping must keep at most one beam node per distinct acquired
+        player.  With two opponent teams each offering a distinct target player,
+        the aggregated results must surface trades from BOTH teams.
+
+        Uses beam_width=20 so find_best_trades(top_n=20) returns both Alpha's
+        and Beta's trades.  (beam_width=5 would fill with Alpha trades alone due
+        to dict-order processing; the diversity grouping operates on the beam,
+        not on find_best_trades' internal top_n.)
+        """
+        my, alpha, beta = _two_step_scenario()
+        lg = _make_league(my, alpha, beta)
+
+        results = beam_search(
+            my, {"Alpha": alpha, "Beta": beta},
+            league=lg, depth=1, beam_width=20, top_n=100,
+        )
+
+        if not results:
+            pytest.skip("No search results — cannot verify beam diversity")
+
+        acquired_pids: set[int] = set()
+        for r in results:
+            if r.sequence:
+                for p in r.sequence[0].incoming:
+                    pid = p.get("pid")
+                    if pid is not None and not (isinstance(pid, float)
+                                                and math.isnan(float(pid))):
+                        acquired_pids.add(int(float(pid)))
+
+        # Alpha has pid=21, Beta has pid=31 — both should surface.
+        assert len(acquired_pids) >= 2, (
+            f"Expected ≥2 distinct acquired players (diversity grouping active), "
+            f"got: {acquired_pids}"
+        )

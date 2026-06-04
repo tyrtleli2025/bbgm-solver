@@ -31,7 +31,7 @@ from typing import Optional
 import pandas as pd
 
 from .formulas import BASE_RATINGS
-from .market_scanner import find_best_trades, _fast_optimize, _build_cache
+from .market_scanner import find_best_trades, _fast_optimize, _build_cache, _compute_team_j
 from .ai_trade_value import league_value_stats, SALARY_CAP_DEFAULT
 from .trade_engine import SALARY_SCALE
 
@@ -92,9 +92,13 @@ class SearchResult:
 
 
 def _compute_j(roster_df: pd.DataFrame) -> float:
-    """Lineup objective J for a roster — the fast O(C(n,5)) path."""
+    """
+    Full team objective J = lineup synergy (top-5) + depth bonus (ranks 6-10).
+    Uses _compute_team_j from market_scanner so the search objective matches
+    the trade scanner's gate objective exactly.
+    """
     caches = [_build_cache(roster_df.iloc[i]) for i in range(len(roster_df))]
-    return _fast_optimize(caches)
+    return _compute_team_j(caches)
 
 
 def _player_key(player) -> object:
@@ -350,8 +354,27 @@ def beam_search(
         if not next_beam:
             break
 
-        next_beam.sort(key=lambda n: n.j_score, reverse=True)
-        beam = next_beam[:beam_width]
+        # Diversity-preserving beam selection.
+        # Group nodes by the identity of the players they acquired in their
+        # most recent trade step.  Keep only the highest-J node per group,
+        # then take the top-beam_width across groups.
+        # This ensures the beam explores different acquisitions rather than
+        # filling with near-identical rosters that all received the same star.
+        _groups: dict[frozenset, _BeamNode] = {}
+        for node in next_beam:
+            if node.sequence:
+                last_step = node.sequence[-1]
+                group_key = frozenset(
+                    _player_key(p) for p in last_step.incoming
+                )
+            else:
+                group_key = frozenset()
+            prev = _groups.get(group_key)
+            if prev is None or node.j_score > prev.j_score:
+                _groups[group_key] = node
+
+        diverse = sorted(_groups.values(), key=lambda n: n.j_score, reverse=True)
+        beam = diverse[:beam_width]
 
     all_results.sort(key=lambda r: r.j_final, reverse=True)
     return all_results[:top_n]

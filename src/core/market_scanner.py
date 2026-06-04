@@ -139,6 +139,47 @@ def _fast_optimize(caches: list[_PlayerCache]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Full-roster objective J  (engine_reference.md §  Team Overall Rating)
+# ---------------------------------------------------------------------------
+
+# Regular-season exponential-decay parameters (engine_reference.md)
+_TEAM_A: float = 0.3334
+_TEAM_B: float = -0.1609
+
+# Precomputed weights w_i = a × e^(b × i) for rotation ranks 0-9.
+# Rank 0 (best player) gets the highest weight.
+_TEAM_WEIGHTS: tuple[float, ...] = tuple(
+    _TEAM_A * math.exp(_TEAM_B * i) for i in range(10)
+)
+
+
+def _compute_team_j(caches: list[_PlayerCache]) -> float:
+    """
+    Full team objective J (lineup synergy + depth bonus).
+
+    J = _fast_optimize(top-5 synergy lineup score)
+      + Σ_{i=5}^{min(9, n-1)}  w_i × sorted_OVR_i
+
+    The depth term uses the regular-season exponential-decay weights from
+    engine_reference.md (a=0.3334, b=-0.1609) for rotation ranks 6-10.
+    This makes J sensitive to depth: trading away a bench player has a cost
+    even when the starting lineup is unchanged, so the search explores
+    diverse packages rather than fixating on the single best top-5 trade.
+
+    The weights for ranks 6-10 are ≈ 0.149, 0.127, 0.108, 0.092, 0.079,
+    so a typical bench player (OVR 65) contributes ≈ 5-10 points to J.
+    """
+    lineup_score = _fast_optimize(caches)
+
+    ovrs = sorted((c.ovr for c in caches), reverse=True)
+    depth_bonus = sum(
+        _TEAM_WEIGHTS[i] * ovrs[i]
+        for i in range(5, min(10, len(ovrs)))
+    )
+    return lineup_score + depth_bonus
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -230,7 +271,7 @@ def find_best_trades(
 
     # --- One-time precomputation for my roster --------------------------------
     my_caches = [_build_cache(my_roster_df.iloc[i]) for i in range(n_mine)]
-    old_score = _fast_optimize(my_caches)
+    old_score = _compute_team_j(my_caches)   # full-roster J (lineup + depth)
 
     # Identify my tradeable players up front
     my_tradeable = [
@@ -269,13 +310,19 @@ def find_best_trades(
                 my_p   = my_roster_df.iloc[i]
                 my_sal = _get_salary(my_p, salary_scale)
 
-                # Gate: salary match for the other team
+                # Gate 1a: salary match — THEIR team absorbing my player
                 if not _salary_match_ok(
                     their_sal, my_sal, their_total_sal, salary_cap
                 ):
                     continue
 
-                # Gate: AI acceptance (their dv from their perspective)
+                # Gate 1b: salary match — MY team absorbing their player
+                if not _salary_match_ok(
+                    my_sal, their_sal, my_total_salary, salary_cap
+                ):
+                    continue
+
+                # Gate 2: AI acceptance (their dv from their perspective)
                 dv = _evaluate_dv(
                     their_df, league,
                     incoming=[their_p],   # what they give up
@@ -285,12 +332,12 @@ def find_best_trades(
                 if dv <= 0:
                     continue
 
-                # Gate: my lineup improvement
+                # Gate 3: my full-roster J improvement
                 post_caches = (
                     [c for k, c in enumerate(my_caches) if k != i]
                     + [their_caches[j]]
                 )
-                new_score  = _fast_optimize(post_caches)
+                new_score  = _compute_team_j(post_caches)
                 net_lineup = new_score - old_score
                 if net_lineup <= 0:
                     continue
@@ -316,8 +363,15 @@ def find_best_trades(
                     my_p2  = my_roster_df.iloc[i2]
                     my_sal = _get_salary(my_p1, salary_scale) + _get_salary(my_p2, salary_scale)
 
+                    # Gate 1a: their salary match
                     if not _salary_match_ok(
                         their_sal, my_sal, their_total_sal, salary_cap
+                    ):
+                        continue
+
+                    # Gate 1b: my salary match
+                    if not _salary_match_ok(
+                        my_sal, their_sal, my_total_salary, salary_cap
                     ):
                         continue
 
@@ -338,7 +392,7 @@ def find_best_trades(
                     if len(post_caches) < 5:
                         continue
 
-                    new_score  = _fast_optimize(post_caches)
+                    new_score  = _compute_team_j(post_caches)
                     net_lineup = new_score - old_score
                     if net_lineup <= 0:
                         continue
