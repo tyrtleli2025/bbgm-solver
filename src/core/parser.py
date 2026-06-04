@@ -171,50 +171,26 @@ def _parse_player(player: dict, current_season: int) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 
-def parse_league_json(
-    filepath: str | Path,
+def parse_league_data(
+    data: dict,
     my_tid: int = 0,
-) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict]:
     """
-    Parse a ZenGM Basketball GM league export JSON.
+    Parse a ZenGM league export from an already-loaded dict.
 
-    Active players are defined as: ``tid ≥ -1`` (rostered or free agent) AND
-    ``retiredYear`` is null.  Draft prospects (``tid == -2``) and retired
-    players (``tid == -3`` or ``retiredYear`` set) are excluded.
+    This is the core parsing logic reused by both ``parse_league_json``
+    (file-based) and the HTTP server endpoint (payload-based).
 
     Parameters
     ----------
-    filepath : path to the ZenGM ``.json`` export file.
-    my_tid   : team ID of the user's team (default 0, the first team).
+    data   : the top-level ZenGM export dict (keys: players, gameAttributes,
+             teams, …).
+    my_tid : team ID of the user's team (default 0).
 
     Returns
     -------
     (my_roster_df, league_rosters_dict, cap_info)
-
-    my_roster_df
-        DataFrame of my team's active players, with columns::
-
-            hgt stre spd jmp endu ins dnk ft fg tp oiq diq drb pss reb
-            pid  name  age  pot  salary  tid  pos
-
-    league_rosters_dict
-        ``{team_abbrev: DataFrame}`` for every *other* rostered team
-        (``tid ≥ 0``, ``tid ≠ my_tid``) that has at least one active player.
-        Free agents are not included.
-        Team labels come from the ``teams[].abbrev`` field; falls back to
-        ``"team_<tid>"`` when no abbreviation is available.
-
-    Raises
-    ------
-    FileNotFoundError
-        If *filepath* does not exist.
-    ValueError
-        If no active players are found for *my_tid*.
     """
-    path = Path(filepath)
-    with path.open("r", encoding="utf-8") as fh:
-        data = json.load(fh)
-
     current_season = _read_season(data)
     cap_info       = _read_cap_info(data)
 
@@ -258,3 +234,32 @@ def parse_league_json(
         )
 
     return my_roster_df, league_rosters_dict, cap_info
+
+
+def parse_league_json(
+    filepath: str | Path,
+    my_tid: int = 0,
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict]:
+    """
+    Parse a ZenGM Basketball GM league export JSON file.
+
+    Thin wrapper around ``parse_league_data`` that handles file I/O.
+
+    Parameters
+    ----------
+    filepath : path to the ZenGM ``.json`` export file.
+    my_tid   : team ID of the user's team (default 0).
+
+    Returns
+    -------
+    (my_roster_df, league_rosters_dict, cap_info)
+
+    Raises
+    ------
+    FileNotFoundError : if *filepath* does not exist.
+    ValueError        : if no active players found for *my_tid*.
+    """
+    path = Path(filepath)
+    with path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    return parse_league_data(data, my_tid=my_tid)

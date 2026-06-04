@@ -8,6 +8,9 @@ Usage
     python main.py --file league.json --tid 3
     python main.py --file league.json --top 10
     python main.py --file league.json --search --depth 3 --beam 5
+    python main.py --serve                        # start local server + print bookmarklet
+    python main.py --serve --port 9999
+    python main.py --serve --ssl-cert cert.pem --ssl-key key.pem
 """
 
 from __future__ import annotations
@@ -196,9 +199,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--file",
-        required=True,
+        required=False,
+        default=None,
         metavar="PATH",
-        help="Path to the ZenGM league export JSON file.",
+        help="Path to the ZenGM league export JSON file (required unless --serve).",
     )
     ap.add_argument(
         "--tid",
@@ -233,13 +237,60 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="K",
         help="Beam width (candidate trades per node) for --search (default: 5).",
     )
+    # ── serve mode ─────────────────────────────────────────────────────────
+    ap.add_argument(
+        "--serve",
+        action="store_true",
+        help=(
+            "Start a local HTTP server (default port 8888) and print the "
+            "browser bookmarklet.  Eliminates the export-download-drag cycle."
+        ),
+    )
+    ap.add_argument(
+        "--port",
+        type=int,
+        default=8888,
+        metavar="PORT",
+        help="Port for --serve mode (default: 8888).",
+    )
+    ap.add_argument(
+        "--ssl-cert",
+        metavar="CERT",
+        dest="ssl_cert",
+        help="PEM certificate file for HTTPS in --serve mode.",
+    )
+    ap.add_argument(
+        "--ssl-key",
+        metavar="KEY",
+        dest="ssl_key",
+        help="PEM private-key file for HTTPS in --serve mode.",
+    )
     return ap
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
+    # ── serve mode (mutually exclusive with --file) ────────────────────────
+    if args.serve:
+        from src.server import start_server  # deferred import (stdlib only)
+        import logging
+        logging.basicConfig(level=logging.INFO,
+                            format="%(asctime)s  %(levelname)s  %(message)s",
+                            datefmt="%H:%M:%S")
+        start_server(
+            port=args.port,
+            ssl_cert=getattr(args, "ssl_cert", None),
+            ssl_key=getattr(args, "ssl_key", None),
+        )
+        return 0   # start_server blocks until Ctrl-C; this line is unreachable
+
     # ── 1. Parse ─────────────────────────────────────────────────────────────
+    if not args.file:
+        print("Error: --file is required (or use --serve to start the local server).",
+              file=sys.stderr)
+        return 1
+
     print(f"\nLoading {args.file} …", end=" ", flush=True)
     try:
         my_roster_df, league_rosters_dict, cap_info = parse_league_json(
