@@ -254,6 +254,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Port for --serve mode (default: 8888).",
     )
     ap.add_argument(
+        "--use-v",
+        action="store_true",
+        dest="use_v_function",
+        help=(
+            "Use horizon-aware V function (multi-year title equity) instead of "
+            "J (instantaneous lineup score). V accounts for player aging, prospect "
+            "upside, and draft picks over a 5-year horizon. Slower but strategically superior."
+        ),
+    )
+    # ── serve mode ─────────────────────────────────────────────────────────
+    ap.add_argument(
         "--ssl-cert",
         metavar="CERT",
         dest="ssl_cert",
@@ -363,6 +374,9 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
+    # Extract current season from league dict (added by league_value_stats)
+    current_season = int(league.get("current_season", 0))
+
     trades = find_best_trades(
         my_roster_df,
         league_rosters_dict,
@@ -370,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
         salary_cap=cap_info["salary_cap"],
         top_n=args.top,
         progress=_on_progress,
+        use_v_function=args.use_v_function,
+        current_season=current_season,
     )
     print(f"\r  Done — {len(trades)} trade(s) found.{' ' * 30}\n")
 
@@ -396,6 +412,8 @@ def main(argv: list[str] | None = None) -> int:
             depth=args.depth,
             beam_width=args.beam,
             top_n=args.top,
+            use_v_function=args.use_v_function,
+            current_season=current_season,
         )
         print(f"done.  {len(sequences)} sequence(s) found.\n")
 
