@@ -236,6 +236,29 @@ def parse_league_data(
     return my_roster_df, league_rosters_dict, cap_info
 
 
+def extract_draft_picks(data: dict) -> list[dict]:
+    """
+    Extract draft picks from a ZenGM export.
+
+    Each pick dict contains:
+        tid       : int  — team owning the pick
+        orig_tid  : int  — original team that owned it (may differ if traded)
+        season    : int  — draft year
+        round     : int  — 1 or 2 (or higher)
+    """
+    picks = []
+    for raw in data.get("draftPicks", []):
+        pick = {
+            "tid": int(raw.get("tid", -1)),
+            "orig_tid": int(raw.get("origTid", -1)),
+            "season": int(raw.get("season", 0)),
+            "round": int(raw.get("round", 1)),
+        }
+        if pick["tid"] >= 0:  # only include picks with valid owner
+            picks.append(pick)
+    return picks
+
+
 def parse_league_json(
     filepath: str | Path,
     my_tid: int = 0,

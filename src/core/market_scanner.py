@@ -19,6 +19,10 @@ For each (team, target player) pair the scanner assembles the minimal package
 of my tradeable assets that satisfies dv > 0.  Package sizes supported: 1-for-1
 and 2-for-1 (we send 2, we receive 1).
 
+Draft picks are valued using actual prospect ratings (tid=-2) from the league
+export when available, falling back to historical VALUE_BY_PICK averages.
+The dv gate already supports draft picks via the trade AI's estValues table.
+
 Performance notes
 -----------------
 • Per-player sigmoid contributions (_PlayerCache) are precomputed once, making
@@ -50,6 +54,7 @@ from .ai_trade_value import (
     SALARY_CAP_DEFAULT as _SALARY_CAP,
     SOFT_CAP_MATCH_PCT as _SOFT_CAP_MATCH_PCT,
 )
+from src.core.parser import extract_draft_picks as _extract_draft_picks
 
 # ---------------------------------------------------------------------------
 # Public constants

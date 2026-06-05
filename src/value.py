@@ -92,10 +92,21 @@ def _rookie_salary(pick: int) -> float:
     return 1360.0   # beyond pick 30
 
 
-def _pick_ovr(slot: int, round_num: int = 1) -> float:
-    """Expected OVR of a drafted player from a given slot."""
+def _pick_ovr(slot: int, round_num: int = 1,
+              undrafted_pool: list[dict] | None = None) -> float:
+    """
+    Expected OVR of a drafted player from a given slot.
+
+    If undrafted_pool (list of actual prospects, sorted by OVR descending) is provided,
+    use the Nth prospect's OVR for slot N. Otherwise fall back to VALUE_BY_PICK average.
+    """
     if round_num > 1:
         return UNDRAFTED_VALUE + 5.0    # late 2nd ≈ slightly above replacement
+
+    if undrafted_pool and slot > 0 and slot <= len(undrafted_pool):
+        from src.core.formulas import player_ovr as _player_ovr
+        return float(_player_ovr(undrafted_pool[slot - 1]))
+
     return VALUE_BY_PICK.get(min(max(slot, 1), 30), 49.3)
 
 
@@ -125,14 +136,19 @@ class LeagueState:
 
     These are extracted directly from the ZenGM JSON export so that
     contract_exp is available (the DataFrame parser drops it).
+
+    undrafted_by_year: dict[int, list[dict]] — undrafted prospects (tid=-2)
+      grouped by draft year, sorted by player_ovr descending. Used to value
+      draft picks based on actual prospect ratings instead of averages.
     """
-    players:        list[dict]
-    teams:          list[dict]
-    picks:          list[dict]
-    current_season: int
-    salary_cap:     float
-    my_tid:         int
-    num_teams:      int = 30
+    players:         list[dict]
+    teams:           list[dict]
+    picks:           list[dict]
+    current_season:  int
+    salary_cap:      float
+    my_tid:          int
+    num_teams:       int = 30
+    undrafted_by_year: dict[int, list[dict]] = field(default_factory=dict)
 
     # ----------- factory ---------------------------------------------------
 
@@ -140,14 +156,39 @@ class LeagueState:
     def from_data(cls, data: dict, my_tid: int = 0) -> "LeagueState":
         """Build a LeagueState from a raw ZenGM export dict."""
         from src.core.parser import _read_season, _read_cap_info
+        from src.core.formulas import player_ovr as _player_ovr
+
         current_season = _read_season(data)
         cap_info       = _read_cap_info(data)
 
         players = []
+        undrafted_by_year: dict[int, list[dict]] = {}
+
         for raw in data.get("players", []):
-            p = _extract_player(raw, current_season)
-            if p is not None:
-                players.append(p)
+            tid = int(raw.get("tid", -1))
+            if tid == -2:  # undrafted prospect
+                p = _extract_undrafted(raw, current_season)
+                if p is not None:
+                    # Infer draft year from ratings array (the era when they'd be drafted)
+                    # If draftYear is set, use it; else use most recent rating season + 1
+                    draft_year = int(raw.get("draftYear", 0))
+                    if not draft_year:
+                        ratings = raw.get("ratings", [])
+                        if ratings:
+                            latest_season = int(ratings[-1].get("season", 0))
+                            # Prospect should be drafted the season after their last rating
+                            draft_year = latest_season + 1
+                        else:
+                            draft_year = current_season + 1
+                    undrafted_by_year.setdefault(draft_year, []).append(p)
+            else:
+                p = _extract_player(raw, current_season)
+                if p is not None:
+                    players.append(p)
+
+        # Sort undrafted by OVR descending (best prospects first)
+        for year in undrafted_by_year:
+            undrafted_by_year[year].sort(key=lambda p: _player_ovr(p), reverse=True)
 
         teams = data.get("teams", [])
         picks = data.get("draftPicks", [])
@@ -159,6 +200,7 @@ class LeagueState:
             salary_cap=cap_info["salary_cap"],
             my_tid=my_tid,
             num_teams=max(len(teams), 30),
+            undrafted_by_year=undrafted_by_year,
         )
 
     @classmethod
@@ -168,10 +210,35 @@ class LeagueState:
         return cls.from_data(data, my_tid=my_tid)
 
 
+def _extract_undrafted(raw: dict, current_season: int) -> Optional[dict]:
+    """Convert a raw undrafted prospect (tid=-2) to value.py format."""
+    ratings_list = raw.get("ratings", [])
+    if not ratings_list:
+        return None
+    r = ratings_list[-1]
+
+    born_year = raw.get("born", {}).get("year", 0)
+    age = float(current_season - born_year) if (current_season and born_year) else 20.0
+
+    p: dict = {k: float(r.get(k, 50.0)) for k in BASE_RATINGS}
+    p.update(
+        pid=int(raw.get("pid", -1)),
+        tid=-2,
+        age=age,
+        pot=float(r.get("pot", 0.0)),
+        salary=1200.0,  # league minimum for undrafted
+        contract_exp=current_season + 1,  # default contract year
+        name=(raw.get("firstName", "") + " " + raw.get("lastName", "")).strip(),
+    )
+    return p
+
+
 def _extract_player(raw: dict, current_season: int) -> Optional[dict]:
     """Convert a raw ZenGM player dict to the flat format used by value.py."""
     tid = int(raw.get("tid", -3))
-    if tid in (-3, -2):          # retired or draft prospect
+    if tid == -3:          # retired
+        return None
+    if tid == -2:          # draft prospect — skip in main players list
         return None
     if raw.get("retiredYear") is not None:
         return None
@@ -328,8 +395,9 @@ class LeagueVContext:
                 if pick_season != ls.current_season + t:
                     continue
                 slot = _estimate_slot(pick_tid, t, team_ovrs)
+                undraft = ls.undrafted_by_year.get(pick_season, [])
                 team_ovrs.setdefault(pick_tid, []).append(
-                    _pick_ovr(slot, round_num)
+                    _pick_ovr(slot, round_num, undrafted_pool=undraft)
                 )
 
             # Fill rosters to minimum size
@@ -402,7 +470,8 @@ class LeagueVContext:
                     continue
                 round_num = int(pick.get("round", 1))
                 slot      = _estimate_slot_for_my_team(my_ovrs, opp_movs)
-                my_ovrs.append(_pick_ovr(slot, round_num))
+                undraft = ls.undrafted_by_year.get(pick_season, [])
+                my_ovrs.append(_pick_ovr(slot, round_num, undrafted_pool=undraft))
 
             while len(my_ovrs) < MIN_ROSTER:
                 my_ovrs.append(self.replacement_ovr)
