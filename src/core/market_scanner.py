@@ -273,6 +273,7 @@ def find_best_trades(
     progress: Optional[Callable[[str, int, int], None]] = None,
     v_context=None,        # Optional[LeagueVContext] — pre-built context
     use_v_function: bool = False,  # auto-build LeagueVContext when no v_context supplied
+    current_season: int = 0,  # season for aging/contract logic; passed to _auto_v_context
 ) -> list[dict]:
     """
     Scan the league for the best available trades for my team.
@@ -300,6 +301,8 @@ def find_best_trades(
     v_context           : pre-built LeagueVContext; takes priority over use_v_function.
     use_v_function      : when True and v_context is None, auto-build a LeagueVContext
                           from the supplied DataFrames and use ΔV as the improvement gate.
+    current_season      : season number for aging/contract logic (default 0). Required for
+                          correct V computation when use_v_function=True.
 
     Returns
     -------
@@ -334,9 +337,11 @@ def find_best_trades(
     n_mine = len(my_roster_df)
 
     # Auto-build LeagueVContext when use_v_function=True and none was supplied.
+    # Use the passed current_season, or infer from league dict if available.
     if use_v_function and v_context is None:
+        season_for_v = current_season or int(league.get("current_season", 0))
         v_context = _auto_v_context(
-            my_roster_df, league_rosters_dict, current_season, salary_cap
+            my_roster_df, league_rosters_dict, season_for_v, salary_cap
         )
 
     # --- One-time precomputation for my roster --------------------------------
