@@ -267,16 +267,21 @@ def beam_search(
     lockout_games:        int   = GAMES_LOCKOUT,
     min_step_j_gain:      float = MIN_STEP_J_GAIN,
     min_total_j_gain:     float = MIN_TOTAL_J_GAIN,
+    v_context=None,        # Optional[LeagueVContext] — score by ΔV when provided
 ) -> list[SearchResult]:
     """
     Depth-limited beam search over trade sequences.
+
+    When v_context (a LeagueVContext) is provided, nodes are scored by the
+    horizon-aware V function (ΔV > 0 gate, V-ranked beam) instead of J.
+    The dv > 0 AI-acceptance gate is always applied regardless.
 
     At each depth step:
       • Each beam node generates up to beam_width candidate trades via
         find_best_trades (all gates: dv > 0, salary match, untradable).
       • Each candidate is applied: my roster and the opponent's roster are
         updated; acquired players are locked for subsequent steps.
-      • Beam is pruned to the top-beam_width nodes by J; previously visited
+      • Beam is pruned to the top-beam_width nodes by score; previously visited
         roster states are skipped.
       • Every newly reached node is recorded as a potential result.
 
@@ -291,11 +296,11 @@ def beam_search(
     salary_cap          : cap in raw salary units (default $90 M in $K).
     salary_scale        : salary divisor passed through (default 1 000).
     lockout_games       : gamesUntilTradable for newly acquired players (default 82).
+    v_context           : LeagueVContext for V-based scoring (optional).
 
     Returns
     -------
     Up to top_n SearchResult objects, sorted by j_final descending.
-    Each sequence has strictly non-decreasing J (every edge has net_lineup_score > 0).
     """
     if len(initial_roster_df) < 5:
         raise ValueError(
@@ -306,7 +311,14 @@ def beam_search(
         all_r = {"__mine__": initial_roster_df, **league_rosters_dict}
         league = league_value_stats(all_r, salary_cap=salary_cap)
 
-    j_start  = _compute_j(initial_roster_df)
+    # Score function: V if v_context provided, else J
+    if v_context is not None:
+        def _score(roster_df: pd.DataFrame) -> float:
+            return v_context.compute_v_for_roster_df(roster_df)
+    else:
+        _score = _compute_j
+
+    j_start  = _score(initial_roster_df)
     init_sig = _roster_signature(initial_roster_df)
 
     beam: list[_BeamNode] = [
@@ -332,6 +344,7 @@ def beam_search(
                 salary_cap=salary_cap,
                 salary_scale=salary_scale,
                 top_n=beam_width,
+                v_context=v_context,
             )
 
             for trade in candidates:
@@ -350,10 +363,11 @@ def beam_search(
                     continue
                 visited.add(new_sig)
 
-                new_j = _compute_j(new_roster)
+                new_j = _score(new_roster)
 
-                # Guardrail A: require a meaningful per-step J gain
-                if new_j - node.j_score < min_step_j_gain:
+                # Per-step gain guardrail (skip if using V — ΔV already pre-filtered
+                # by find_best_trades; J-path keeps its min gain check)
+                if v_context is None and new_j - node.j_score < min_step_j_gain:
                     continue
 
                 # Guardrail B: reject steps that decrease age-adjusted roster value.

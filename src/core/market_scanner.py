@@ -215,6 +215,7 @@ def find_best_trades(
     salary_scale: float = SALARY_SCALE,
     top_n: int = TOP_N_DEFAULT,
     progress: Optional[Callable[[str, int, int], None]] = None,
+    v_context=None,   # Optional[LeagueVContext] — uses ΔV instead of ΔJ when provided
 ) -> list[dict]:
     """
     Scan the league for the best available trades for my team.
@@ -274,6 +275,8 @@ def find_best_trades(
 
     # --- One-time precomputation for my roster --------------------------------
     my_caches = [_build_cache(my_roster_df.iloc[i]) for i in range(n_mine)]
+    # When v_context is provided, use V-based scoring (ΔV) instead of ΔJ.
+    # J is still computed here for the case v_context is None.
     old_score = _compute_team_j(my_caches)   # full-roster J (lineup + depth)
 
     # Identify my tradeable players up front
@@ -337,22 +340,33 @@ def find_best_trades(
                 if dv <= 0:
                     continue
 
-                # Gate 3: my full-roster J improvement
-                post_caches = (
-                    [c for k, c in enumerate(my_caches) if k != i]
-                    + [their_caches[j]]
-                )
-                new_score  = _compute_team_j(post_caches)
-                net_lineup = new_score - old_score
-                if net_lineup <= 0:
+                # Gate 3: improvement in the objective (J or V)
+                if v_context is not None:
+                    their_d = their_p.to_dict()
+                    my_d    = my_p.to_dict()
+                    net_score = v_context.delta_v(
+                        add_players=[their_d], remove_players=[my_d]
+                    )
+                    new_score = v_context.v_current + net_score
+                else:
+                    post_caches = (
+                        [c for k, c in enumerate(my_caches) if k != i]
+                        + [their_caches[j]]
+                    )
+                    new_score  = _compute_team_j(post_caches)
+                    net_score  = new_score - old_score
+                    their_d    = their_p.to_dict()
+                    my_d       = my_p.to_dict()
+
+                if net_score <= 0:
                     continue
 
                 passing.append({
                     "team":             team_name,
                     "trade_type":       "1-for-1",
-                    "incoming":         [their_p.to_dict()],
-                    "outgoing":         [my_p.to_dict()],
-                    "net_lineup_score": net_lineup,
+                    "incoming":         [their_d],
+                    "outgoing":         [my_d],
+                    "net_lineup_score": net_score,
                     "dv":               dv,
                     "new_score":        new_score,
                 })
@@ -390,24 +404,35 @@ def find_best_trades(
                         continue
 
                     drop = {i1, i2}
-                    post_caches = (
-                        [c for k, c in enumerate(my_caches) if k not in drop]
-                        + [their_caches[j]]
-                    )
-                    if len(post_caches) < 5:
-                        continue
+                    their_d = their_p.to_dict()
+                    my_d1   = my_p1.to_dict()
+                    my_d2   = my_p2.to_dict()
 
-                    new_score  = _compute_team_j(post_caches)
-                    net_lineup = new_score - old_score
-                    if net_lineup <= 0:
+                    if v_context is not None:
+                        net_score = v_context.delta_v(
+                            add_players=[their_d],
+                            remove_players=[my_d1, my_d2],
+                        )
+                        new_score = v_context.v_current + net_score
+                    else:
+                        post_caches = (
+                            [c for k, c in enumerate(my_caches) if k not in drop]
+                            + [their_caches[j]]
+                        )
+                        if len(post_caches) < 5:
+                            continue
+                        new_score = _compute_team_j(post_caches)
+                        net_score = new_score - old_score
+
+                    if net_score <= 0:
                         continue
 
                     passing.append({
                         "team":             team_name,
                         "trade_type":       "2-for-1",
-                        "incoming":         [their_p.to_dict()],
-                        "outgoing":         [my_p1.to_dict(), my_p2.to_dict()],
-                        "net_lineup_score": net_lineup,
+                        "incoming":         [their_d],
+                        "outgoing":         [my_d1, my_d2],
+                        "net_lineup_score": net_score,
                         "dv":               dv,
                         "new_score":        new_score,
                     })
