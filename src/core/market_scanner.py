@@ -551,6 +551,152 @@ def find_best_trades(
                         "new_score":        new_score,
                     })
 
+        # ── Pick trades (V-based only) ─────────────────────────────────────
+        # These are useful for rebuilding teams that trade veterans for future picks.
+        if v_context is not None and len(my_tradeable) > 0:
+            # Find draft picks owned by this team
+            my_tid_from_df = int(my_roster_df.iloc[0].get("tid", 0))
+            their_picks = [p for p in v_context.ls.picks
+                          if int(p.get("tid", -1)) == int(my_tid_from_df if my_tid_from_df == 0 else my_tid_from_df)]
+
+            # Group picks by team via simple team matching
+            # Use team_name to identify which picks belong to this opponent
+            their_tid = None
+            for team in v_context.ls.teams:
+                team_abbrev = team.get("abbrev") or team.get("name", "")
+                if team_abbrev == team_name:
+                    their_tid = int(team.get("tid", -1))
+                    break
+
+            if their_tid is not None and their_tid >= 0:
+                their_picks = [p for p in v_context.ls.picks
+                              if int(p.get("tid", -1)) == their_tid]
+            else:
+                their_picks = []
+
+            # ── 1 player out → 1 pick in ───────────────────────────────────
+            for pick_idx, pick in enumerate(their_picks):
+                for i in my_tradeable:
+                    my_p = my_roster_df.iloc[i]
+                    my_d = my_p.to_dict()
+
+                    # dv: we give player, they give pick
+                    # For AI's perspective: they lose pick, gain player
+                    dv = _evaluate_dv(
+                        their_df, league,
+                        incoming=[my_p],   # what they receive
+                        outgoing=[],       # what they give up (picks have value but are separate)
+                        strategy=their_strategy,
+                    )
+                    if dv <= 0:
+                        continue
+
+                    # V evaluation: we gain a pick, lose a player
+                    # Represent the pick as a pseudo-player in the roster simulation
+                    # (LeagueVContext handles picks in delta_v via ls.picks)
+                    net_score = v_context.delta_v(
+                        add_players=[],
+                        remove_players=[my_d],
+                        add_picks=[pick],
+                        remove_picks=[],
+                    )
+                    new_score = v_context.v_current + net_score
+
+                    if net_score <= 0:
+                        continue
+
+                    pick_label = f"Pick {pick.get('season')} R{pick.get('round')}"
+                    passing.append({
+                        "team":             team_name,
+                        "trade_type":       "player-for-pick",
+                        "incoming":         [{"_pick": pick, "name": pick_label}],
+                        "outgoing":         [my_d],
+                        "net_lineup_score": net_score,
+                        "dv":               dv,
+                        "new_score":        new_score,
+                    })
+
+            # ── 1 player out → 2 picks in ──────────────────────────────────
+            if len(their_picks) >= 2:
+                for pick_pair in itertools.combinations(range(len(their_picks)), 2):
+                    for i in my_tradeable:
+                        my_p = my_roster_df.iloc[i]
+                        my_d = my_p.to_dict()
+
+                        dv = _evaluate_dv(
+                            their_df, league,
+                            incoming=[my_p],
+                            outgoing=[],
+                            strategy=their_strategy,
+                        )
+                        if dv <= 0:
+                            continue
+
+                        pick1 = their_picks[pick_pair[0]]
+                        pick2 = their_picks[pick_pair[1]]
+
+                        net_score = v_context.delta_v(
+                            add_players=[],
+                            remove_players=[my_d],
+                            add_picks=[pick1, pick2],
+                            remove_picks=[],
+                        )
+                        new_score = v_context.v_current + net_score
+
+                        if net_score <= 0:
+                            continue
+
+                        pick_label = f"Picks {pick1.get('season')} R{pick1.get('round')} + {pick2.get('season')} R{pick2.get('round')}"
+                        passing.append({
+                            "team":             team_name,
+                            "trade_type":       "player-for-2picks",
+                            "incoming":         [{"_pick": pick1, "name": pick_label}, {"_pick": pick2}],
+                            "outgoing":         [my_d],
+                            "net_lineup_score": net_score,
+                            "dv":               dv,
+                            "new_score":        new_score,
+                        })
+
+            # ── 2 players out → 1 pick in ──────────────────────────────────
+            if len(my_tradeable) >= 2:
+                for pick in their_picks:
+                    for i1, i2 in itertools.combinations(my_tradeable, 2):
+                        my_p1 = my_roster_df.iloc[i1]
+                        my_p2 = my_roster_df.iloc[i2]
+                        my_d1 = my_p1.to_dict()
+                        my_d2 = my_p2.to_dict()
+
+                        dv = _evaluate_dv(
+                            their_df, league,
+                            incoming=[my_p1, my_p2],
+                            outgoing=[],
+                            strategy=their_strategy,
+                        )
+                        if dv <= 0:
+                            continue
+
+                        net_score = v_context.delta_v(
+                            add_players=[],
+                            remove_players=[my_d1, my_d2],
+                            add_picks=[pick],
+                            remove_picks=[],
+                        )
+                        new_score = v_context.v_current + net_score
+
+                        if net_score <= 0:
+                            continue
+
+                        pick_label = f"Pick {pick.get('season')} R{pick.get('round')}"
+                        passing.append({
+                            "team":             team_name,
+                            "trade_type":       "2players-for-pick",
+                            "incoming":         [{"_pick": pick, "name": pick_label}],
+                            "outgoing":         [my_d1, my_d2],
+                            "net_lineup_score": net_score,
+                            "dv":               dv,
+                            "new_score":        new_score,
+                        })
+
         n_done += 1
         if progress:
             progress(team_name, n_done, n_total)

@@ -518,6 +518,8 @@ class LeagueVContext:
         add_players / remove_players are player dicts as returned by
         DataFrame.to_dict(); we look up the full player info (including
         contract_exp) via pid from the precomputed pid map.
+
+        add_picks / remove_picks modify the team's draft picks for future seasons.
         """
         remove_pids = {
             int(float(p["pid"]))
@@ -548,7 +550,30 @@ class LeagueVContext:
             player_to_add["tid"] = self.my_tid
             new_players.append(player_to_add)
 
-        return self._compute_my_v(new_players) - self.v_current
+        # Handle picks: modify the league state's pick list
+        new_picks = list(self.ls.picks)
+        if remove_picks:
+            remove_pick_ids = {
+                (int(p.get("tid", -1)), int(p.get("season", 0)), int(p.get("round", 0)))
+                for p in remove_picks
+            }
+            new_picks = [
+                p for p in new_picks
+                if (int(p.get("tid", -1)), int(p.get("season", 0)), int(p.get("round", 0)))
+                not in remove_pick_ids
+            ]
+        if add_picks:
+            new_picks.extend(add_picks)
+
+        # Temporarily update the league state's picks for this computation
+        old_picks = self.ls.picks
+        self.ls.picks = new_picks
+        try:
+            new_v = self._compute_my_v(new_players)
+        finally:
+            self.ls.picks = old_picks
+
+        return new_v - self.v_current
 
     def compute_v_for_roster_df(self, roster_df) -> float:
         """
