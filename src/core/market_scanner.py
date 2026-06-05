@@ -23,6 +23,13 @@ Draft picks are valued using actual prospect ratings (tid=-2) from the league
 export when available, falling back to historical VALUE_BY_PICK averages.
 The dv gate already supports draft picks via the trade AI's estValues table.
 
+TODO: expand to mixed trades (player+pick combinations). Currently only player
+trades are generated. Pick trading would require:
+  1. Generate combinations of (players_out, picks_out) × (players_in, picks_in)
+  2. Evaluate via dv gate (passes picks separately as dpidsAdd/dpidsRemove)
+  3. Score via V (use LeagueVContext.delta_v with picks included)
+  See _build_picks_by_team() helper for pick extraction by team.
+
 Performance notes
 -----------------
 • Per-player sigmoid contributions (_PlayerCache) are precomputed once, making
@@ -210,6 +217,37 @@ def _total_salary(roster_df: pd.DataFrame) -> float:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+def _build_picks_by_team(
+    league_data: dict,
+    my_tid: int,
+) -> dict[str, list[dict]]:
+    """
+    Extract draft picks from league data and group by owning team name.
+
+    Returns {team_abbrev: [pick1, pick2, ...]} for all picks owned by
+    opponents (excluding my team's picks).
+    """
+    picks_list = _extract_draft_picks(league_data)
+
+    # Build tid→abbrev mapping
+    team_label: dict[int, str] = {}
+    for team in league_data.get("teams", []):
+        t = int(team.get("tid", -99))
+        abbrev = team.get("abbrev") or team.get("name") or f"team_{t}"
+        team_label[t] = str(abbrev)
+
+    # Group picks by team
+    picks_by_team: dict[str, list[dict]] = {}
+    for pick in picks_list:
+        tid = int(pick.get("tid", -1))
+        if tid == my_tid or tid < 0:
+            continue
+        team_abbrev = team_label.get(tid, f"team_{tid}")
+        picks_by_team.setdefault(team_abbrev, []).append(pick)
+
+    return picks_by_team
 
 
 def _auto_v_context(
