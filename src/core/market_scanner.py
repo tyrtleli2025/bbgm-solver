@@ -207,6 +207,62 @@ def _total_salary(roster_df: pd.DataFrame) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _auto_v_context(
+    my_roster_df: pd.DataFrame,
+    league_rosters_dict: dict[str, pd.DataFrame],
+    current_season: int,
+    salary_cap: float,
+):
+    """
+    Build a LeagueVContext from roster DataFrames when use_v_function=True
+    but no pre-built v_context is provided.
+
+    Uses contract_exp=current_season+3 for all players (DataFrames don't
+    carry contract expiry).  This is sufficient to capture the age trajectory
+    signal — young players project as improving, old players as declining.
+    """
+    from src.value import LeagueState, LeagueVContext  # lazy import avoids circularity
+
+    players: list[dict] = []
+
+    my_tid: int = 0
+    if "tid" in my_roster_df.columns and len(my_roster_df) > 0:
+        raw = my_roster_df.iloc[0].get("tid")
+        if raw is not None and not (isinstance(raw, float) and math.isnan(raw)):
+            my_tid = int(raw)
+
+    for i in range(len(my_roster_df)):
+        row = my_roster_df.iloc[i].to_dict()
+        row.setdefault("contract_exp", current_season + 3)
+        players.append(row)
+
+    for _, df in league_rosters_dict.items():
+        if df is None or len(df) == 0:
+            continue
+        for i in range(len(df)):
+            row = df.iloc[i].to_dict()
+            row.setdefault("contract_exp", current_season + 3)
+            players.append(row)
+
+    all_tids = sorted({
+        int(p["tid"]) for p in players
+        if p.get("tid") is not None
+        and not (isinstance(p["tid"], float) and math.isnan(p["tid"]))
+    })
+    teams = [{"tid": t} for t in all_tids]
+
+    ls = LeagueState(
+        players=players,
+        teams=teams,
+        picks=[],
+        current_season=current_season,
+        salary_cap=salary_cap,
+        my_tid=my_tid,
+        num_teams=max(30, len(teams)),
+    )
+    return LeagueVContext(ls)
+
+
 def find_best_trades(
     my_roster_df: pd.DataFrame,
     league_rosters_dict: dict[str, pd.DataFrame],
@@ -215,7 +271,8 @@ def find_best_trades(
     salary_scale: float = SALARY_SCALE,
     top_n: int = TOP_N_DEFAULT,
     progress: Optional[Callable[[str, int, int], None]] = None,
-    v_context=None,   # Optional[LeagueVContext] — uses ΔV instead of ΔJ when provided
+    v_context=None,        # Optional[LeagueVContext] — pre-built context
+    use_v_function: bool = False,  # auto-build LeagueVContext when no v_context supplied
 ) -> list[dict]:
     """
     Scan the league for the best available trades for my team.
@@ -240,6 +297,9 @@ def find_best_trades(
     salary_scale        : passed through for salary context (default 1 000).
     top_n               : maximum results to return (default 5).
     progress            : optional callable(team_name, n_done, n_total).
+    v_context           : pre-built LeagueVContext; takes priority over use_v_function.
+    use_v_function      : when True and v_context is None, auto-build a LeagueVContext
+                          from the supplied DataFrames and use ΔV as the improvement gate.
 
     Returns
     -------
@@ -248,7 +308,7 @@ def find_best_trades(
         'trade_type'       : str   — '1-for-1' or '2-for-1'
         'incoming'         : list  — player dicts arriving on my roster
         'outgoing'         : list  — player dicts leaving my roster
-        'net_lineup_score' : float — improvement to my optimal lineup score
+        'net_lineup_score' : float — improvement to my optimal lineup score (ΔV or ΔJ)
         'dv'               : float — the AI's acceptance margin (> 0)
         'new_score'        : float — my new optimal lineup score
     """
@@ -272,6 +332,12 @@ def find_best_trades(
     sal_cap_type     = str(league.get("salary_cap_type", "soft"))
     sal_match_pct    = float(league.get("soft_cap_trade_match", _SOFT_CAP_MATCH_PCT))
     n_mine = len(my_roster_df)
+
+    # Auto-build LeagueVContext when use_v_function=True and none was supplied.
+    if use_v_function and v_context is None:
+        v_context = _auto_v_context(
+            my_roster_df, league_rosters_dict, current_season, salary_cap
+        )
 
     # --- One-time precomputation for my roster --------------------------------
     my_caches = [_build_cache(my_roster_df.iloc[i]) for i in range(n_mine)]

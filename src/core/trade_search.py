@@ -267,7 +267,8 @@ def beam_search(
     lockout_games:        int   = GAMES_LOCKOUT,
     min_step_j_gain:      float = MIN_STEP_J_GAIN,
     min_total_j_gain:     float = MIN_TOTAL_J_GAIN,
-    v_context=None,        # Optional[LeagueVContext] — score by ΔV when provided
+    v_context=None,        # Optional[LeagueVContext] — pre-built context
+    use_v_function: bool = False,  # auto-build LeagueVContext when none supplied
 ) -> list[SearchResult]:
     """
     Depth-limited beam search over trade sequences.
@@ -310,6 +311,16 @@ def beam_search(
     if league is None:
         all_r = {"__mine__": initial_roster_df, **league_rosters_dict}
         league = league_value_stats(all_r, salary_cap=salary_cap)
+
+    # Auto-build LeagueVContext once when use_v_function=True; reused across all steps.
+    if use_v_function and v_context is None:
+        from .market_scanner import _auto_v_context
+        v_context = _auto_v_context(
+            initial_roster_df,
+            league_rosters_dict,
+            int(league.get("current_season", 0)),
+            salary_cap,
+        )
 
     # Score function: V if v_context provided, else J
     if v_context is not None:
