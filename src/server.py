@@ -108,6 +108,37 @@ try{
 })()"""
 
 
+# Third bookmarklet — re-signing advisor (POSTs to /resign)
+BOOKMARKLET_RESIGN_BODY: str = """\
+(async()=>{
+const m=location.pathname.match(/\\/l\\/(\\d+)/);
+if(!m)return alert('Open a ZenGM league page first');
+const lid=m[1],tid=+(prompt('Your team ID?','0')||0);
+const db=await new Promise((r,j)=>{
+  const o=indexedDB.open('league'+lid);
+  o.onsuccess=e=>r(e.target.result);o.onerror=j});
+const A=s=>new Promise((r,j)=>{
+  const q=db.transaction(s,'readonly').objectStore(s).getAll();
+  q.onsuccess=e=>r(e.target.result);q.onerror=j});
+const[pl,ga]=await Promise.all([A('players'),A('gameAttributes')]);
+const tm=await A('teams').catch(()=>[]);
+const body=JSON.stringify({players:pl,gameAttributes:ga,teams:tm,tid});
+try{
+  const d=await(await fetch('http://localhost:PORT/resign',{
+    method:'POST',headers:{'Content-Type':'application/json'},body})).json();
+  const rows=d.players||[];
+  const icon={resign:'✅',borderline:'🟡','let walk':'❌'};
+  alert(rows.length?rows.map(p=>
+    `${icon[p.recommendation]||'?'} ${p.name} age${p.age} OVR ${p.current_ovr}→${p.projected_ovr} $${Math.round((p.demand_k||0)/1000)}M/yr ΔV=${(p.delta_v||0).toFixed(4)} [${p.recommendation}]`
+  ).join('\\n'):'No expiring contracts next season')
+}catch(e){
+  navigator.clipboard.writeText(body)
+    .then(()=>alert('Blocked. Payload copied.\\nRun: python main.py --serve\\nError: '+e.message))
+    .catch(()=>alert('Error: '+e.message))
+}
+})()"""
+
+
 # Second bookmarklet — team strength evaluator (POSTs to /evaluate)
 BOOKMARKLET_EVAL_BODY: str = """\
 (async()=>{
@@ -155,6 +186,11 @@ def make_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str:
 def make_eval_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str:
     """Return the team-strength-evaluator `javascript:` URL."""
     return _minify_bm(BOOKMARKLET_EVAL_BODY, port, scheme)
+
+
+def make_resign_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str:
+    """Return the re-signing advisor `javascript:` URL."""
+    return _minify_bm(BOOKMARKLET_RESIGN_BODY, port, scheme)
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +389,50 @@ def evaluate(payload: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Re-signing advisor
+# ---------------------------------------------------------------------------
+
+
+def resign(payload: dict) -> dict:
+    """
+    Recommend whether to re-sign each expiring player on my roster.
+
+    Requires the V function — builds a LeagueVContext internally.
+    """
+    from src.core.market_scanner import _auto_v_context
+    from src.core.resigning import recommend_resigning
+
+    my_tid = int(payload.get("tid", 0))
+    my_roster_df, league_rosters_dict, cap_info = parse_league_data(
+        payload, my_tid=my_tid
+    )
+
+    all_rosters = {"__mine__": my_roster_df, **league_rosters_dict}
+    league = league_value_stats(
+        all_rosters,
+        current_season=cap_info.get("current_season", 0),
+        salary_cap=cap_info["salary_cap"],
+        salary_cap_type=cap_info["salary_cap_type"],
+        soft_cap_trade_match=cap_info["soft_cap_trade_match"],
+        team_strategies=cap_info.get("team_strategies", {}),
+    )
+
+    current_season = int(league.get("current_season", 0))
+    v_context = _auto_v_context(
+        my_roster_df, league_rosters_dict, current_season, cap_info["salary_cap"]
+    )
+
+    players = recommend_resigning(my_roster_df, league_rosters_dict, league, v_context)
+
+    log.info(
+        "Resign: tid=%d  expiring=%d  current_season=%d",
+        my_tid, len(players), current_season,
+    )
+
+    return {"players": players, "current_season": current_season}
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -371,15 +451,20 @@ class SolverHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.rstrip("/")
-        if path not in ("/solve", "/evaluate"):
-            self._send(404, {"error": "endpoints: POST /solve  POST /evaluate"})
+        if path not in ("/solve", "/evaluate", "/resign"):
+            self._send(404, {"error": "endpoints: POST /solve  POST /evaluate  POST /resign"})
             return
         try:
             length  = int(self.headers.get("Content-Length", 0))
             body    = self.rfile.read(length)
             payload = json.loads(body)
             use_v   = getattr(self.server, "use_v", False)
-            result  = solve(payload, use_v=use_v) if path == "/solve" else evaluate(payload)
+            if path == "/solve":
+                result = solve(payload, use_v=use_v)
+            elif path == "/evaluate":
+                result = evaluate(payload)
+            else:
+                result = resign(payload)
             self._send(200, result)
         except ValueError as exc:
             self._send(400, {"error": str(exc)})
@@ -442,8 +527,9 @@ def start_server(
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
 
-    bm      = make_bookmarklet(port, scheme=scheme)
-    bm_eval = make_eval_bookmarklet(port, scheme=scheme)
+    bm        = make_bookmarklet(port, scheme=scheme)
+    bm_eval   = make_eval_bookmarklet(port, scheme=scheme)
+    bm_resign = make_resign_bookmarklet(port, scheme=scheme)
     print()
     print("=" * 70)
     print(f"  BBGM Solver server  —  {scheme}://localhost:{port}")
@@ -458,6 +544,11 @@ def start_server(
     print("  Ranks all teams by lineup strength; shows your synergy breakdown.")
     print()
     print(bm_eval)
+    print()
+    print("── BOOKMARKLET 3: Re-signing Advisor ────────────────────────────────")
+    print("  Shows which expiring contracts are worth re-signing (requires --use-v).")
+    print()
+    print(bm_resign)
     print()
     print("── NOTES ───────────────────────────────────────────────────────────")
     if scheme == "http":
