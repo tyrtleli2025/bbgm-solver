@@ -108,6 +108,41 @@ try{
 })()"""
 
 
+# Fourth bookmarklet — unified offseason optimizer (POSTs to /optimize)
+BOOKMARKLET_OPT_BODY: str = """\
+(async()=>{
+const m=location.pathname.match(/\\/l\\/(\\d+)/);
+if(!m)return alert('Open a ZenGM league page first');
+const lid=m[1],tid=+(prompt('Your team ID?','0')||0);
+const db=await new Promise((r,j)=>{
+  const o=indexedDB.open('league'+lid);
+  o.onsuccess=e=>r(e.target.result);o.onerror=j});
+const A=s=>new Promise((r,j)=>{
+  const q=db.transaction(s,'readonly').objectStore(s).getAll();
+  q.onsuccess=e=>r(e.target.result);q.onerror=j});
+const[pl,ga]=await Promise.all([A('players'),A('gameAttributes')]);
+const tm=await A('teams').catch(()=>[]);
+const body=JSON.stringify({players:pl,gameAttributes:ga,teams:tm,tid});
+try{
+  const d=await(await fetch('http://localhost:PORT/optimize',{
+    method:'POST',headers:{'Content-Type':'application/json'},body})).json();
+  const hdr=`OFFSEASON PLAN — Projected V: ${(d.projected_v||0).toFixed(4)}\\n`;
+  const acts=(d.actions||[]).map(a=>{
+    if(a.type==='trade')return`[TRADE] ${a.description} ΔV=+${(a.delta_v||0).toFixed(4)}`;
+    if(a.type==='resign')return`[RESIGN] ${a.name} $${Math.round((a.demand_k||0)/1000)}M/yr ΔV=+${(a.delta_v||0).toFixed(4)}`;
+    return`[${(a.type||'?').toUpperCase()}] ${a.name||a.description||''}`;
+  });
+  const walks=(d.let_walk||[]).map(p=>`[LET WALK] ${p.name} (declining, cap better used elsewhere)`);
+  const cap=`Remaining cap: $${((d.remaining_cap_k||0)/1000).toFixed(1)}M`;
+  alert(hdr+'\\n'+[...acts,...walks,cap].join('\\n')||'No actions recommended')
+}catch(e){
+  navigator.clipboard.writeText(body)
+    .then(()=>alert('Blocked. Payload copied.\\nRun: python main.py --serve\\nError: '+e.message))
+    .catch(()=>alert('Error: '+e.message))
+}
+})()"""
+
+
 # Third bookmarklet — re-signing advisor (POSTs to /resign)
 BOOKMARKLET_RESIGN_BODY: str = """\
 (async()=>{
@@ -191,6 +226,11 @@ def make_eval_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str
 def make_resign_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str:
     """Return the re-signing advisor `javascript:` URL."""
     return _minify_bm(BOOKMARKLET_RESIGN_BODY, port, scheme)
+
+
+def make_opt_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str:
+    """Return the unified optimizer `javascript:` URL."""
+    return _minify_bm(BOOKMARKLET_OPT_BODY, port, scheme)
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +473,40 @@ def resign(payload: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Unified offseason optimizer
+# ---------------------------------------------------------------------------
+
+
+def optimize(payload: dict) -> dict:
+    """
+    Run the unified decision optimizer over re-signings and trades.
+    """
+    from src.core.optimizer_joint import optimize_decisions
+
+    my_tid = int(payload.get("tid", 0))
+    my_roster_df, league_rosters_dict, cap_info = parse_league_data(
+        payload, my_tid=my_tid
+    )
+
+    all_rosters = {"__mine__": my_roster_df, **league_rosters_dict}
+    league = league_value_stats(
+        all_rosters,
+        current_season=cap_info.get("current_season", 0),
+        salary_cap=cap_info["salary_cap"],
+        salary_cap_type=cap_info["salary_cap_type"],
+        soft_cap_trade_match=cap_info["soft_cap_trade_match"],
+        team_strategies=cap_info.get("team_strategies", {}),
+    )
+
+    log.info(
+        "Optimize: tid=%d  season=%d  cap=$%.0fK",
+        my_tid, cap_info.get("current_season", 0), cap_info["salary_cap"],
+    )
+
+    return optimize_decisions(my_roster_df, league_rosters_dict, league, cap_info)
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -451,8 +525,8 @@ class SolverHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.rstrip("/")
-        if path not in ("/solve", "/evaluate", "/resign"):
-            self._send(404, {"error": "endpoints: POST /solve  POST /evaluate  POST /resign"})
+        if path not in ("/solve", "/evaluate", "/resign", "/optimize"):
+            self._send(404, {"error": "endpoints: POST /solve  POST /evaluate  POST /resign  POST /optimize"})
             return
         try:
             length  = int(self.headers.get("Content-Length", 0))
@@ -463,8 +537,10 @@ class SolverHandler(BaseHTTPRequestHandler):
                 result = solve(payload, use_v=use_v)
             elif path == "/evaluate":
                 result = evaluate(payload)
-            else:
+            elif path == "/resign":
                 result = resign(payload)
+            else:
+                result = optimize(payload)
             self._send(200, result)
         except ValueError as exc:
             self._send(400, {"error": str(exc)})
@@ -530,6 +606,7 @@ def start_server(
     bm        = make_bookmarklet(port, scheme=scheme)
     bm_eval   = make_eval_bookmarklet(port, scheme=scheme)
     bm_resign = make_resign_bookmarklet(port, scheme=scheme)
+    bm_opt    = make_opt_bookmarklet(port, scheme=scheme)
     print()
     print("=" * 70)
     print(f"  BBGM Solver server  —  {scheme}://localhost:{port}")
@@ -549,6 +626,11 @@ def start_server(
     print("  Shows which expiring contracts are worth re-signing (requires --use-v).")
     print()
     print(bm_resign)
+    print()
+    print("── BOOKMARKLET 4: Unified Offseason Optimizer ───────────────────────")
+    print("  Combines trades and re-signings into one ranked plan (requires --use-v).")
+    print()
+    print(bm_opt)
     print()
     print("── NOTES ───────────────────────────────────────────────────────────")
     if scheme == "http":
