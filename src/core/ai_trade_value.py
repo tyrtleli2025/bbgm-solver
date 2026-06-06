@@ -500,6 +500,13 @@ def sum_values_debug(
 
         total += v
 
+        # Extract contract expiration for debugging
+        contract_exp = int(
+            _get(player, "contract_exp")
+            or _get(player, "exp")
+            or (int(league.get("current_season", 0)) + 1)
+        )
+
         breakdowns.append({
             "name": name,
             "age": age,
@@ -508,6 +515,7 @@ def sum_values_debug(
             "difficulty_mult": difficulty_mult,
             "strategy_mult": strategy_mult,
             "injury_mult": injury_mult,
+            "contract_exp": contract_exp,
             "contract_value": cv,
             "contract_adj": contract_adj,
             "v_before_exp": v_before_exp,

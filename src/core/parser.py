@@ -58,7 +58,7 @@ _TID_FREE_AGENT      = -1
 # ---------------------------------------------------------------------------
 
 #: Non-rating metadata columns appended alongside the 15 base ratings.
-META_COLUMNS: list[str] = ["pid", "name", "age", "pot", "salary", "tid", "pos"]
+META_COLUMNS: list[str] = ["pid", "name", "age", "pot", "salary", "contract_exp", "tid", "pos"]
 
 #: Full column order guaranteed in every output DataFrame.
 OUTPUT_COLUMNS: list[str] = BASE_RATINGS + META_COLUMNS
@@ -148,6 +148,7 @@ def _parse_player(player: dict, current_season: int) -> Optional[dict]:
     # --- contract / salary ---
     contract = player.get("contract", {}) or {}
     salary = float(contract.get("amount", 0.0))   # already in $K
+    contract_exp = int(contract.get("exp", current_season + 1))  # expiration year
 
     # --- name ---
     first = player.get("firstName", "")
@@ -155,13 +156,14 @@ def _parse_player(player: dict, current_season: int) -> Optional[dict]:
     name  = f"{first} {last}".strip() or f"pid_{player.get('pid', '?')}"
 
     row.update({
-        "pid":    int(player.get("pid", -1)),
-        "name":   name,
-        "age":    age,
-        "pot":    float(r.get("pot", 0.0)),
-        "salary": salary,
-        "tid":    tid,
-        "pos":    str(r.get("pos", "")),
+        "pid":          int(player.get("pid", -1)),
+        "name":         name,
+        "age":          age,
+        "pot":          float(r.get("pot", 0.0)),
+        "salary":       salary,
+        "contract_exp": contract_exp,
+        "tid":          tid,
+        "pos":          str(r.get("pos", "")),
     })
     return row
 
@@ -193,6 +195,7 @@ def parse_league_data(
     """
     current_season = _read_season(data)
     cap_info       = _read_cap_info(data)
+    cap_info["current_season"] = current_season  # Add season for contract expiry detection
 
     # Build tid → abbreviation lookup from the teams list
     team_label: dict[int, str] = {}
