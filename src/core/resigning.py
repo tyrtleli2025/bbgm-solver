@@ -69,7 +69,6 @@ def recommend_resigning(
     Returns a list of dicts sorted by delta_v descending.
     """
     current_season = int(league.get("current_season", 0))
-    expiry_season = current_season + 1
     my_tid = v_context.my_tid
     ovr_mean = float(league.get("ovr_mean", 65.0))
     ovr_std = float(league.get("ovr_std", 10.0))
@@ -80,7 +79,7 @@ def recommend_resigning(
         row = my_roster_df.iloc[i]
         contract_exp = int(row.get("contract_exp") or 0)
 
-        if contract_exp != expiry_season:
+        if contract_exp != current_season:
             continue
 
         name = str(row.get("name") or f"pid_{row.get('pid')}")

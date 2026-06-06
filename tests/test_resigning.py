@@ -81,16 +81,16 @@ _LEAGUE_DICT = {"OPP": _OPP_DF}
 
 class TestNoExpiringContracts:
     def test_returns_empty_when_no_expiry(self):
-        """Players with long-term deals are excluded."""
-        players = [_player(70, contract_exp=SEASON + 3, pid=i) for i in range(5)]
+        """Players with long-term deals (contract_exp > SEASON) are excluded."""
+        players = [_player(70, contract_exp=SEASON + 2, pid=i) for i in range(5)]
         my_df = _df(*players)
         league, ctx = _make_league_and_ctx(my_df, _LEAGUE_DICT)
         results = recommend_resigning(my_df, _LEAGUE_DICT, league, ctx)
         assert results == []
 
-    def test_excludes_already_expired(self):
-        """Contracts that already expired (contract_exp == SEASON) are not included."""
-        player = _player(65, contract_exp=SEASON, pid=1)
+    def test_excludes_non_expiring(self):
+        """Contracts expiring next season (contract_exp == SEASON+1) are not included."""
+        player = _player(65, contract_exp=SEASON + 1, pid=1)
         my_df = _df(player)
         league, ctx = _make_league_and_ctx(my_df, _LEAGUE_DICT)
         results = recommend_resigning(my_df, _LEAGUE_DICT, league, ctx)
@@ -100,7 +100,7 @@ class TestNoExpiringContracts:
 class TestExpiringContracts:
     def test_detects_expiring_next_season(self):
         """A player whose contract_exp == SEASON+1 appears in results."""
-        player = _player(70, age=27, contract_exp=SEASON + 1, pid=1, name="Expiring")
+        player = _player(70, age=27, contract_exp=SEASON, pid=1, name="Expiring")
         my_df = _df(player)
         league, ctx = _make_league_and_ctx(my_df, _LEAGUE_DICT)
         results = recommend_resigning(my_df, _LEAGUE_DICT, league, ctx)
@@ -109,7 +109,7 @@ class TestExpiringContracts:
 
     def test_result_fields_present(self):
         """Each result has all required fields."""
-        player = _player(70, age=27, contract_exp=SEASON + 1, pid=1)
+        player = _player(70, age=27, contract_exp=SEASON, pid=1)
         my_df = _df(player)
         league, ctx = _make_league_and_ctx(my_df, _LEAGUE_DICT)
         results = recommend_resigning(my_df, _LEAGUE_DICT, league, ctx)
@@ -120,7 +120,7 @@ class TestExpiringContracts:
 
     def test_recommendation_values(self):
         """Recommendation is one of the three valid strings."""
-        player = _player(70, age=27, contract_exp=SEASON + 1, pid=1)
+        player = _player(70, age=27, contract_exp=SEASON, pid=1)
         my_df = _df(player)
         league, ctx = _make_league_and_ctx(my_df, _LEAGUE_DICT)
         results = recommend_resigning(my_df, _LEAGUE_DICT, league, ctx)
@@ -128,8 +128,8 @@ class TestExpiringContracts:
 
     def test_sorted_by_delta_v_descending(self):
         """Results are sorted by delta_v descending (best deal first)."""
-        star   = _player(80, age=26, contract_exp=SEASON + 1, pid=1, name="Star")
-        fringe = _player(45, age=34, contract_exp=SEASON + 1, pid=2, name="Fringe")
+        star   = _player(80, age=26, contract_exp=SEASON, pid=1, name="Star")
+        fringe = _player(45, age=34, contract_exp=SEASON, pid=2, name="Fringe")
         my_df  = _df(star, fringe)
         league, ctx = _make_league_and_ctx(my_df, _LEAGUE_DICT)
         results = recommend_resigning(my_df, _LEAGUE_DICT, league, ctx)
@@ -138,7 +138,7 @@ class TestExpiringContracts:
 
     def test_star_recommended_resign(self):
         """A high-OVR young player should be recommended for resignation."""
-        star = _player(82, age=25, contract_exp=SEASON + 1, pid=1, name="Star")
+        star = _player(82, age=25, contract_exp=SEASON, pid=1, name="Star")
         my_df = _df(star)
         league, ctx = _make_league_and_ctx(my_df, _LEAGUE_DICT)
         results = recommend_resigning(my_df, _LEAGUE_DICT, league, ctx)
@@ -147,7 +147,7 @@ class TestExpiringContracts:
 
     def test_aging_scrub_let_walk(self):
         """An old low-OVR player whose demand exceeds their value should be let walk."""
-        scrub = _player(42, age=38, salary=5_000, contract_exp=SEASON + 1,
+        scrub = _player(42, age=38, salary=5_000, contract_exp=SEASON,
                         pid=1, name="OldScrub")
         my_df = _df(scrub)
         league, ctx = _make_league_and_ctx(my_df, _LEAGUE_DICT)
@@ -157,7 +157,7 @@ class TestExpiringContracts:
 
     def test_projected_ovr_younger_improves(self):
         """A young player's projected OVR should be >= current OVR."""
-        young = _player(60, age=20, contract_exp=SEASON + 1, pid=1)
+        young = _player(60, age=20, contract_exp=SEASON, pid=1)
         my_df = _df(young)
         league, ctx = _make_league_and_ctx(my_df, _LEAGUE_DICT)
         results = recommend_resigning(my_df, _LEAGUE_DICT, league, ctx)
@@ -165,7 +165,7 @@ class TestExpiringContracts:
 
     def test_demand_is_positive(self):
         """Salary demand must always be at least the minimum contract."""
-        player = _player(65, age=28, contract_exp=SEASON + 1, pid=1)
+        player = _player(65, age=28, contract_exp=SEASON, pid=1)
         my_df = _df(player)
         league, ctx = _make_league_and_ctx(my_df, _LEAGUE_DICT)
         results = recommend_resigning(my_df, _LEAGUE_DICT, league, ctx)
@@ -173,8 +173,8 @@ class TestExpiringContracts:
 
     def test_multiple_expiring_all_returned(self):
         """All expiring players are returned, non-expiring excluded."""
-        expiring1 = _player(70, contract_exp=SEASON + 1, pid=1, name="A")
-        expiring2 = _player(65, contract_exp=SEASON + 1, pid=2, name="B")
+        expiring1 = _player(70, contract_exp=SEASON, pid=1, name="A")
+        expiring2 = _player(65, contract_exp=SEASON, pid=2, name="B")
         locked    = _player(75, contract_exp=SEASON + 3, pid=3, name="C")
         my_df = _df(expiring1, expiring2, locked)
         league, ctx = _make_league_and_ctx(my_df, _LEAGUE_DICT)
@@ -197,7 +197,7 @@ class TestServerEndpoint:
             "pid": 1, "firstName": "Test", "lastName": "Player",
             "tid": MY_TID,
             "born": {"year": SEASON - 27},
-            "contract": {"amount": 10_000, "exp": SEASON + 1},
+            "contract": {"amount": 10_000, "exp": SEASON},
             "ratings": [{
                 "season": SEASON, "pot": 70, "ovr": 65, "pos": "SF",
                 **{r: 65 for r in BASE_RATINGS},
@@ -233,7 +233,7 @@ class TestServerEndpoint:
             "pid": 1, "firstName": "Expiring", "lastName": "Star",
             "tid": MY_TID,
             "born": {"year": SEASON - 26},
-            "contract": {"amount": 12_000, "exp": SEASON + 1},
+            "contract": {"amount": 12_000, "exp": SEASON},
             "ratings": [{
                 "season": SEASON, "pot": 78, "ovr": 75, "pos": "SF",
                 **{r: 75 for r in BASE_RATINGS},
