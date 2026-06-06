@@ -249,6 +249,7 @@ def solve(payload: dict) -> dict:
     all_rosters = {"__mine__": my_roster_df, **league_rosters_dict}
     league = league_value_stats(
         all_rosters,
+        current_season=cap_info.get("current_season", 0),
         salary_cap=cap_info["salary_cap"],
         salary_cap_type=cap_info["salary_cap_type"],
         soft_cap_trade_match=cap_info["soft_cap_trade_match"],

@@ -311,7 +311,7 @@ def beam_search(
 
     if league is None:
         all_r = {"__mine__": initial_roster_df, **league_rosters_dict}
-        league = league_value_stats(all_r, salary_cap=salary_cap)
+        league = league_value_stats(all_r, current_season=current_season, salary_cap=salary_cap)
 
     # Auto-build LeagueVContext once when use_v_function=True; reused across all steps.
     # Use the passed current_season, or infer from league dict if available.

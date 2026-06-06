@@ -369,7 +369,7 @@ def find_best_trades(
         league = _league_value_stats(
             all_rosters,
             salary_cap=salary_cap,
-            current_season=0,
+            current_season=current_season,
             is_offseason=False,
         )
 
