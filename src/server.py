@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 from src.core.ai_trade_value import league_value_stats
-from src.core.market_scanner import find_best_trades, _build_cache, _compute_team_j
+from src.core.market_scanner import find_best_trades, _build_cache, _compute_team_j, _auto_v_context
 from src.core.optimizer import optimize_rotation
 from src.core.parser import parse_league_data
 from src.core.trade_search import beam_search
@@ -94,11 +94,12 @@ const body=JSON.stringify({players:pl,gameAttributes:ga,teams:tm,tid});
 try{
   const d=await(await fetch('http://localhost:PORT/solve',{
     method:'POST',headers:{'Content-Type':'application/json'},body})).json();
-  alert((d.trades||[]).slice(0,5).map((t,i)=>
-    `#${i+1} ${t.team} ${t.trade_type} +${(t.net_lineup_score||0).SCOREFMT} dv=${(t.dv||0).toFixed(2)}\\n`+
+  const hdr=d.current_v!=null?`Current V: ${d.current_v.toFixed(4)} (title equity over 5 years)\\n\\n`:'';
+  alert(hdr+((d.trades||[]).slice(0,5).map((t,i)=>
+    `#${i+1} ${t.team} ${t.trade_type} ΔV=${(t.net_lineup_score||0).toFixed(4)} dv=${(t.dv||0).toFixed(2)}\\n`+
     (t.incoming||[]).map(p=>' IN: '+(p.name||p.pid)).join('\\n')+'\\n'+
     (t.outgoing||[]).map(p=>'OUT: '+(p.name||p.pid)).join('\\n')
-  ).join('\\n---\\n')||'No trades found')
+  ).join('\\n---\\n')||'No trades found'))
 }catch(e){
   navigator.clipboard.writeText(body)
     .then(()=>alert('Server unreachable (HTTPS\\u2192HTTP blocked?).\\nPayload copied to clipboard.\\nRun: python main.py --serve\\nError: '+e.message))
@@ -139,17 +140,16 @@ try{
 })()"""
 
 
-def _minify_bm(raw: str, port: int, scheme: str, use_v: bool = False) -> str:
+def _minify_bm(raw: str, port: int, scheme: str) -> str:
     import re
-    score_fmt = "toFixed(4)+'V'" if use_v else "toFixed(1)+'J'"
-    body = raw.replace("\n", "").replace("PORT", str(port)).replace("SCOREFMT", score_fmt)
+    body = raw.replace("\n", "").replace("PORT", str(port))
     body = body.replace("http://localhost", f"{scheme}://localhost")
     return f"javascript:{re.sub(r'  +', ' ', body)}"
 
 
-def make_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http", use_v: bool = False) -> str:
+def make_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str:
     """Return the trade-finder `javascript:` URL."""
-    return _minify_bm(BOOKMARKLET_BODY, port, scheme, use_v=use_v)
+    return _minify_bm(BOOKMARKLET_BODY, port, scheme)
 
 
 def make_eval_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str:
@@ -257,9 +257,22 @@ def solve(payload: dict, use_v: bool = False) -> dict:
         soft_cap_trade_match=cap_info["soft_cap_trade_match"],
     )
 
+    current_season = int(league.get("current_season", 0))
+
+    # Build LeagueVContext once when in V mode so v_current and find_best_trades
+    # share the same precomputed opponent MOVs (avoids rebuilding ~30 ms twice).
+    v_context  = None
+    current_v  = None
+    if use_v:
+        v_context = _auto_v_context(
+            my_roster_df, league_rosters_dict, current_season, cap_info["salary_cap"]
+        )
+        current_v = float(v_context.v_current)
+
     log.info(
-        "Solving for tid=%d  my=%d players  opponents=%d teams  cap=$%.0fK  use_v=%s",
-        my_tid, len(my_roster_df), len(league_rosters_dict), cap_info["salary_cap"], use_v,
+        "Solving for tid=%d  my=%d players  opponents=%d teams  cap=$%.0fK  use_v=%s  V=%.4f",
+        my_tid, len(my_roster_df), len(league_rosters_dict), cap_info["salary_cap"],
+        use_v, current_v or 0.0,
     )
 
     trades = find_best_trades(
@@ -267,7 +280,8 @@ def solve(payload: dict, use_v: bool = False) -> dict:
         league_rosters_dict,
         league=league,
         salary_cap=cap_info["salary_cap"],
-        current_season=int(league.get("current_season", 0)),
+        current_season=current_season,
+        v_context=v_context,
         use_v_function=use_v,
         top_n=5,
     )
@@ -275,6 +289,7 @@ def solve(payload: dict, use_v: bool = False) -> dict:
     return {
         "cap":       cap_info["salary_cap"],
         "use_v":     use_v,
+        "current_v": current_v,
         "trades":    _serialise_trades(trades),
         "sequences": [],
     }
@@ -426,7 +441,7 @@ def start_server(
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
 
-    bm      = make_bookmarklet(port, scheme=scheme, use_v=use_v)
+    bm      = make_bookmarklet(port, scheme=scheme)
     bm_eval = make_eval_bookmarklet(port, scheme=scheme)
     print()
     print("=" * 70)
