@@ -214,12 +214,47 @@ def _recompute_dv(action: dict, current_players: list[dict], v_context) -> float
     return v_after - v_before
 
 
-def _conflicts_with(action: dict, consumed_pids: set[int]) -> bool:
-    """True if any player involved in *action* has already been committed."""
-    involved = action["_remove_pids"]
-    if action.get("_expiring_pid") is not None:
-        involved = involved | {action["_expiring_pid"]}
-    return bool(involved & consumed_pids)
+def _is_feasible(
+    action: dict,
+    current_player_pids: set[int],
+    consumed_pids: set[int],
+) -> bool:
+    """
+    Return True only when all four feasibility guards pass.
+
+    Guard 1 — don't send a player already committed (resigned or traded away).
+    Guard 2 — don't act on an expiring player whose disposition is already set.
+    Guard 3 — don't send a player no longer on the current roster.
+    Guard 4 — don't acquire a player already on the current roster.
+              (For resign actions the same pid is both removed and added,
+               so we check net-new pids: add_pids minus remove_pids.)
+    """
+    remove_pids   = action["_remove_pids"]
+    expiring_pid  = action.get("_expiring_pid")
+    add_pids      = {
+        _pid_of(p)
+        for p in action["_add_players"]
+        if _pid_of(p) is not None
+    }
+
+    # Guard 1: no outgoing player is already committed
+    if remove_pids & consumed_pids:
+        return False
+
+    # Guard 2: expiring player not already acted on
+    if expiring_pid is not None and expiring_pid in consumed_pids:
+        return False
+
+    # Guard 3: all outgoing players are actually on my roster right now
+    if not remove_pids.issubset(current_player_pids):
+        return False
+
+    # Guard 4: no net-new incoming player is already on my roster
+    genuinely_new = add_pids - remove_pids
+    if genuinely_new & current_player_pids:
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -304,18 +339,21 @@ def optimize_decisions(
 
     # --- Greedy search ---
     current_players: list[dict] = list(v_context._my_players)
+    current_player_pids: set[int] = {
+        _pid_of(p) for p in current_players if _pid_of(p) is not None
+    }
     current_v = initial_v
-    current_payroll = _current_salary(current_players)
     consumed_pids: set[int] = set()
     applied: list[dict] = []
 
     while action_pool:
-        best_idx = None
-        best_dv = _MIN_DV
-        best_players: Optional[list[dict]] = None
+        best_idx   = None
+        best_dv    = _MIN_DV
+        best_players:     Optional[list[dict]] = None
+        best_player_pids: Optional[set[int]]   = None
 
         for idx, action in enumerate(action_pool):
-            if _conflicts_with(action, consumed_pids):
+            if not _is_feasible(action, current_player_pids, consumed_pids):
                 continue
 
             new_players = _apply_action_to_players(
@@ -328,9 +366,17 @@ def optimize_decisions(
 
             dv = _recompute_dv(action, current_players, v_context)
             if dv > best_dv:
-                best_dv = dv
+                best_dv  = dv
                 best_idx = idx
                 best_players = new_players
+                # Pre-compute the new pid set so we don't repeat work on commit
+                add_pids = {
+                    _pid_of(p) for p in action["_add_players"]
+                    if _pid_of(p) is not None
+                }
+                best_player_pids = (
+                    (current_player_pids - action["_remove_pids"]) | add_pids
+                )
 
         if best_idx is None:
             break
@@ -338,27 +384,28 @@ def optimize_decisions(
         chosen = action_pool.pop(best_idx)
         chosen["delta_v"] = best_dv
 
-        # Mark involved pids as consumed
+        # Commit: mark outgoing and expiring pids so they can't be re-used
         consumed_pids |= chosen["_remove_pids"]
         if chosen.get("_expiring_pid") is not None:
             consumed_pids.add(chosen["_expiring_pid"])
 
-        # Update state
-        current_players = best_players
+        # --- Update the three pieces of state ---
+        # 1. Roster: current_players already computed as best_players above
+        current_players    = best_players
+        # 2. Opponent pool guard: current_player_pids tracks who is on my roster;
+        #    any future action that tries to add a pid in this set is blocked by Guard 4.
+        current_player_pids = best_player_pids
+        # 3. Cap: recompute directly from the new roster to avoid delta drift.
+        #    Let-walk players are still in current_players at this point; we adjust
+        #    for them after the loop.
         current_v = v_context._compute_my_v(current_players)
-        current_payroll += chosen["_salary_delta"]
 
         # Build clean output action (no private _ fields)
         out = {k: v for k, v in chosen.items() if not k.startswith("_")}
         applied.append(out)
 
     # --- Collect let-walk players ---
-    resigned_pids = {
-        a["_expiring_pid"] if "_expiring_pid" in a else None
-        for a in applied
-        if a.get("type") == "resign"  # already stripped, use consumed instead
-    }
-    # expiring players whose pid is NOT in consumed_pids were let walk
+    # Expiring players whose pid is NOT in consumed_pids were not acted on → let walk.
     let_walk = []
     for i in range(len(my_roster_df)):
         row = my_roster_df.iloc[i]
@@ -372,6 +419,16 @@ def optimize_decisions(
                 age=int(float(row.get("age") or 27)),
                 current_ovr=round(float(player_ovr(row)), 1),
             ))
+
+    # --- Cap: recompute from final roster, then adjust for let-walk departures ---
+    # current_players still contains the expiring-but-let-walk players at their old
+    # salary.  After the season they depart and each slot costs MIN_CONTRACT instead.
+    current_payroll = _current_salary(current_players)
+    for p in current_players:
+        pid = _pid_of(p)
+        if pid in expiring_pids and pid not in consumed_pids:
+            current_payroll -= float(p.get("salary", 0) or 0)
+            current_payroll += MIN_CONTRACT
 
     remaining_cap_k = max(0.0, salary_cap - current_payroll)
 

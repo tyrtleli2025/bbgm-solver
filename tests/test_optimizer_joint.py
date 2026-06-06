@@ -200,6 +200,82 @@ class TestExpiringContracts:
 
 
 # ---------------------------------------------------------------------------
+# State management guards
+# ---------------------------------------------------------------------------
+
+class TestStateManagement:
+    def test_no_player_appears_in_both_actions_and_let_walk(self):
+        """A player can't be both resigned (in actions) and in let_walk."""
+        expiring = _player(75, age=26, salary=12_000, contract_exp=SEASON, pid=1, name="Exp")
+        locked   = [_player(65, pid=10+i, name=f"Lock{i}") for i in range(7)]
+        opp_players = [_player(55, tid=OPP_TID, pid=100+i, name=f"Opp{i}") for i in range(8)]
+        my_df, league_dict, league, ci = _build([expiring] + locked, opp_players)
+        result = optimize_decisions(my_df, league_dict, league, ci)
+
+        action_names = {a.get("name") for a in result["actions"]}
+        walk_names   = {p["name"] for p in result["let_walk"]}
+        # Intersection must be empty
+        assert not (action_names & walk_names), (
+            f"Player appears in both actions and let_walk: {action_names & walk_names}"
+        )
+
+    def test_no_duplicate_player_in_applied_actions(self):
+        """The same player pid must not appear as incoming in more than one action."""
+        my_players  = [_player(70, pid=i, name=f"My{i}", salary=8_000) for i in range(8)]
+        opp_players = [_player(80, tid=OPP_TID, pid=100+i, name=f"Star{i}", salary=6_000)
+                       for i in range(8)]
+        my_df, league_dict, league, ci = _build(my_players, opp_players)
+        result = optimize_decisions(my_df, league_dict, league, ci)
+
+        # Collect all pids received across all trade actions
+        acquired: list[int] = []
+        for action in result["actions"]:
+            for p in action.get("incoming") or []:
+                pid = p.get("pid")
+                if pid is not None:
+                    acquired.append(int(float(pid)))
+        assert len(acquired) == len(set(acquired)), (
+            f"Same player acquired twice: {[p for p in acquired if acquired.count(p) > 1]}"
+        )
+
+    def test_no_player_sent_twice(self):
+        """A player sent in one trade must not appear as outgoing in another."""
+        my_players  = [_player(70, pid=i, name=f"My{i}", salary=8_000) for i in range(8)]
+        opp_players = [_player(80, tid=OPP_TID, pid=100+i, name=f"Star{i}", salary=6_000)
+                       for i in range(8)]
+        my_df, league_dict, league, ci = _build(my_players, opp_players)
+        result = optimize_decisions(my_df, league_dict, league, ci)
+
+        sent: list[int] = []
+        for action in result["actions"]:
+            for p in action.get("outgoing") or []:
+                pid = p.get("pid")
+                if pid is not None:
+                    sent.append(int(float(pid)))
+        assert len(sent) == len(set(sent)), (
+            f"Same player sent twice: {[p for p in sent if sent.count(p) > 1]}"
+        )
+
+    def test_cap_decreases_after_expensive_resign(self):
+        """Resigning an expensive player reduces remaining cap space."""
+        expiring = _player(80, age=26, salary=5_000, contract_exp=SEASON, pid=1, name="Star")
+        locked   = [_player(65, pid=10+i, name=f"Lock{i}", salary=8_000) for i in range(7)]
+        opp_players = [_player(55, tid=OPP_TID, pid=100+i, name=f"Opp{i}") for i in range(8)]
+        my_df, league_dict, league, ci = _build([expiring] + locked, opp_players)
+
+        base_payroll = sum(p["salary"] for p in [expiring] + locked)
+        result = optimize_decisions(my_df, league_dict, league, ci)
+
+        cap = float(ci["salary_cap"])
+        # After resigning a player at a higher salary, remaining cap should be
+        # less than cap minus base_payroll
+        resign_actions = [a for a in result["actions"] if a.get("type") == "resign"]
+        if resign_actions:
+            expected_max_cap = cap - base_payroll
+            assert result["remaining_cap_k"] <= expected_max_cap + 1  # +1 for rounding
+
+
+# ---------------------------------------------------------------------------
 # Cap tracking
 # ---------------------------------------------------------------------------
 
