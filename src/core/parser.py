@@ -197,8 +197,9 @@ def parse_league_data(
     cap_info       = _read_cap_info(data)
     cap_info["current_season"] = current_season  # Add season for contract expiry detection
 
-    # Build tid → abbreviation lookup from the teams list
-    team_label: dict[int, str] = {}
+    # Build tid → abbreviation and strategy lookups from the teams list
+    team_label:    dict[int, str] = {}
+    team_strategy: dict[int, str] = {}
     for team in data.get("teams", []):
         t = int(team.get("tid", -99))
         abbrev = (
@@ -207,6 +208,10 @@ def parse_league_data(
             or f"team_{t}"
         )
         team_label[t] = str(abbrev)
+        s = team.get("strategy", "")
+        if s:
+            team_strategy[t] = str(s)
+    cap_info["team_strategies"] = team_strategy
 
     # Parse every player; bucket by tid
     rows_by_tid: dict[int, list[dict]] = {}

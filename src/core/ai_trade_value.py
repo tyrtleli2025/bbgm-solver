@@ -211,6 +211,7 @@ def league_value_stats(
     salary_cap: float = SALARY_CAP_DEFAULT,
     salary_cap_type: str = "soft",
     soft_cap_trade_match: float = SOFT_CAP_MATCH_PCT,
+    team_strategies: Optional[dict[int, str]] = None,
 ) -> League:
     """
     Compute league-wide statistics needed for z-scoring player values (§ 4).
@@ -255,6 +256,7 @@ def league_value_stats(
         return dict(
             ovr_mean=47.0, ovr_std=10.0,
             playerOvrMean=_VALUE_CENTRE, playerOvrStd=_VALUE_SCALE,
+            team_strategies=team_strategies or {},
             salary_cap=salary_cap,
             salary_cap_type=salary_cap_type,
             soft_cap_trade_match=soft_cap_trade_match,
@@ -295,6 +297,7 @@ def league_value_stats(
     return dict(
         ovr_mean=ovr_mean, ovr_std=ovr_std,
         playerOvrMean=playerOvrMean, playerOvrStd=playerOvrStd,
+        team_strategies=team_strategies or {},
         salary_cap=salary_cap,
         salary_cap_type=salary_cap_type,
         soft_cap_trade_match=soft_cap_trade_match,
@@ -322,9 +325,8 @@ def infer_strategy(roster: pd.DataFrame) -> str:
     """
     Infer 'contending' or 'rebuilding' from a roster (§ 6).
 
-    Heuristic: 'contending' when the top-3 OVR average ≥ 75 AND the roster
-    mean age ≥ 25 (win-now talent on a prime-age team).  Can be overridden
-    by passing strategy= explicitly to evaluate_dv().
+    Heuristic fallback used when no strategy is available from the JSON export.
+    'contending' when the top-3 OVR average ≥ 75 AND the roster mean age ≥ 25.
     """
     if len(roster) == 0:
         return "rebuilding"
@@ -336,7 +338,7 @@ def infer_strategy(roster: pd.DataFrame) -> str:
     top_ovr  = float(np.mean(ovrs[: min(3, len(ovrs))]))
     mean_age = float(np.mean(ages))
 
-    if top_ovr >= 75 and mean_age >= 25.0:
+    if top_ovr >= 75.0 and mean_age >= 25.0:
         return "contending"
     return "rebuilding"
 
@@ -594,7 +596,19 @@ def evaluate_dv(
     difficulty        : game difficulty applied to AI's outgoing side (§ 8).
     """
     if strategy is None:
-        strategy = infer_strategy(other_team_roster)
+        # Prefer the strategy stored in the JSON export; fall back to heuristic.
+        team_strategies = league.get("team_strategies") or {}
+        tid: Optional[int] = None
+        if other_team_roster is not None and len(other_team_roster) > 0:
+            raw = _get(other_team_roster.iloc[0], "tid")
+            if raw is not None:
+                try:
+                    tid = int(float(raw))
+                except (ValueError, TypeError):
+                    pass
+        strategy = team_strategies.get(tid) if tid is not None else None
+        if not strategy:
+            strategy = infer_strategy(other_team_roster)
 
     # From the AI's perspective:
     #   assetsAdded   = what we send it (they receive)

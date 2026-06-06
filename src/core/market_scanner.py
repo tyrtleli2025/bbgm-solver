@@ -412,7 +412,9 @@ def find_best_trades(
             continue
 
         n_theirs = len(their_df)
-        their_strategy    = _infer_strategy(their_df)
+        _team_strategies  = league.get("team_strategies") or {}
+        _their_tid        = int(their_df.iloc[0].get("tid", -1)) if len(their_df) > 0 else -1
+        their_strategy    = _team_strategies.get(_their_tid) or _infer_strategy(their_df)
         their_caches      = [_build_cache(their_df.iloc[j]) for j in range(n_theirs)]
         their_total_sal   = _total_salary(their_df)
 

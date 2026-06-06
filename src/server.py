@@ -255,6 +255,7 @@ def solve(payload: dict, use_v: bool = False) -> dict:
         salary_cap=cap_info["salary_cap"],
         salary_cap_type=cap_info["salary_cap_type"],
         soft_cap_trade_match=cap_info["soft_cap_trade_match"],
+        team_strategies=cap_info.get("team_strategies", {}),
     )
 
     current_season = int(league.get("current_season", 0))

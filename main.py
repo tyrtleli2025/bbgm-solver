@@ -330,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
         salary_cap=cap_info["salary_cap"],
         salary_cap_type=cap_info["salary_cap_type"],
         soft_cap_trade_match=cap_info["soft_cap_trade_match"],
+        team_strategies=cap_info.get("team_strategies", {}),
     )
 
     print(
