@@ -47,11 +47,10 @@ SALARY_CAP_DEFAULT: float = 90_000.0
 SOFT_CAP_MATCH_PCT: float = 1.25
 """Soft-cap rule: incoming salary ≤ 125 % of outgoing when over the cap."""
 
-# These are the implicit centre and spread of the OVR-normalised scale produced
-# by player_base_value().  The normalisation formula maps an average player to
-# exactly 47 and one OVR-std above average to 57, so the target spread is 10.
-# ZenGM calls these "playerOvrMean / playerOvrStd" and does not compute them
-# from a second pass over player.value — they are fixed by the formula.
+# Fallback constants used when no league dict is available (e.g. unit tests
+# that don't call league_value_stats).  The actual values are computed from
+# player_base_value() in the second pass of league_value_stats() and stored
+# as "playerOvrMean" / "playerOvrStd" in the returned League dict.
 _VALUE_CENTRE: float = 47.0
 _VALUE_SCALE: float  = 10.0
 
@@ -214,11 +213,19 @@ def league_value_stats(
     soft_cap_trade_match: float = SOFT_CAP_MATCH_PCT,
 ) -> League:
     """
-    Compute league-wide OVR statistics needed for z-scoring.
+    Compute league-wide statistics needed for z-scoring player values (§ 4).
 
-    ZenGM does not compute a separate second pass over player.value — it
-    z-scores player.value directly against the OVR distribution (§ 4):
-        v = (player.value − ovr_mean) / ovr_std
+    Two-pass computation:
+      Pass 1 — raw OVR mean/std used to normalise ratings inside
+               player_base_value() (the ~0-100 BBGM value scale).
+      Pass 2 — player_base_value() is called for every rostered player
+               (free agents tid=-1 excluded); the resulting mean and std
+               become playerOvrMean / playerOvrStd, which are the values
+               the z-score formula divides by:
+                   v = (p.value − playerOvrMean) / playerOvrStd
+
+    A normal basketball league yields playerOvrMean ≈ 47, playerOvrStd ≈ 10.
+    A warning is logged when the computed values fall outside those bounds.
 
     Parameters
     ----------
@@ -231,10 +238,13 @@ def league_value_stats(
 
     Returns
     -------
-    League dict with keys: ovr_mean, ovr_std,
+    League dict with keys: ovr_mean, ovr_std, playerOvrMean, playerOvrStd,
     salary_cap, salary_cap_type, soft_cap_trade_match,
     current_season, is_offseason.
     """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
     all_players = [
         df.iloc[i]
         for df in all_rosters.values()
@@ -244,6 +254,7 @@ def league_value_stats(
     if not all_players:
         return dict(
             ovr_mean=47.0, ovr_std=10.0,
+            playerOvrMean=_VALUE_CENTRE, playerOvrStd=_VALUE_SCALE,
             salary_cap=salary_cap,
             salary_cap_type=salary_cap_type,
             soft_cap_trade_match=soft_cap_trade_match,
@@ -251,12 +262,39 @@ def league_value_stats(
             is_offseason=is_offseason,
         )
 
+    # Pass 1: raw OVR stats (used inside player_base_value for normalisation)
     ovrs     = np.array([player_ovr(p) for p in all_players], dtype=float)
     ovr_mean = float(ovrs.mean())
     ovr_std  = float(max(ovrs.std(), 1.0))
 
+    _partial_league = dict(ovr_mean=ovr_mean, ovr_std=ovr_std)
+
+    # Pass 2: compute player_base_value for every rostered player (tid != -1)
+    rostered = [
+        p for p in all_players
+        if _get(p, "tid") is None or int(float(_get(p, "tid"))) >= 0
+    ]
+    if not rostered:
+        playerOvrMean = _VALUE_CENTRE
+        playerOvrStd  = _VALUE_SCALE
+    else:
+        base_vals     = np.array(
+            [player_base_value(p, _partial_league) for p in rostered], dtype=float
+        )
+        playerOvrMean = float(base_vals.mean())
+        playerOvrStd  = float(max(base_vals.std(), 1.0))
+
+    # Sanity check — a normal league should land close to mean≈47, std≈10
+    if not (30.0 <= playerOvrMean <= 65.0) or not (3.0 <= playerOvrStd <= 25.0):
+        _log.warning(
+            "playerOvrMean=%.1f playerOvrStd=%.1f outside expected range "
+            "(mean 30–65, std 3–25); check player ratings.",
+            playerOvrMean, playerOvrStd,
+        )
+
     return dict(
         ovr_mean=ovr_mean, ovr_std=ovr_std,
+        playerOvrMean=playerOvrMean, playerOvrStd=playerOvrStd,
         salary_cap=salary_cap,
         salary_cap_type=salary_cap_type,
         soft_cap_trade_match=soft_cap_trade_match,
@@ -387,19 +425,18 @@ def sum_values(
                       Positive = harder (AI values its players more).
     """
     contracts_factor = 2.0 if strategy == "rebuilding" else 0.5
+    value_mean = float(league.get("playerOvrMean") or _VALUE_CENTRE)
+    value_std  = float(league.get("playerOvrStd")  or _VALUE_SCALE)
     total = 0.0
 
     for player in assets:
         age = float(_get(player, "age") or 27.0)
 
-        # 1. Base z-score (§ 4).
-        #    player_base_value() normalises OVR to mean ≈ 47, std ≈ 10 by design.
-        #    ZenGM z-scores directly against those fixed constants (playerOvrMean/Std)
-        #    rather than computing a second-pass mean/std from player.value.
+        # 1. Base z-score (§ 4): v = (p.value − playerOvrMean) / playerOvrStd
         #    raw_v is preserved for contract_value() — that formula must use the
         #    pre-adjustment z-score (§ 7).
         base  = player_base_value(player, league)
-        raw_v = zscore(base, _VALUE_CENTRE, _VALUE_SCALE)
+        raw_v = zscore(base, value_mean, value_std)
         v     = raw_v
 
         # 2. Difficulty fudge — applied only to positive values, BEFORE strategy
@@ -451,6 +488,8 @@ def sum_values_debug(
       v_before_exp, final_v
     """
     contracts_factor = 2.0 if strategy == "rebuilding" else 0.5
+    value_mean = float(league.get("playerOvrMean") or _VALUE_CENTRE)
+    value_std  = float(league.get("playerOvrStd")  or _VALUE_SCALE)
     total = 0.0
     breakdowns = []
 
@@ -458,9 +497,9 @@ def sum_values_debug(
         name = str(_get(player, "name") or f"pid_{_get(player, 'pid')}")
         age = float(_get(player, "age") or 27.0)
 
-        # 1. Base z-score
+        # 1. Base z-score: v = (p.value − playerOvrMean) / playerOvrStd
         base = player_base_value(player, league)
-        raw_v = zscore(base, _VALUE_CENTRE, _VALUE_SCALE)
+        raw_v = zscore(base, value_mean, value_std)
         v = raw_v
 
         # 2. Difficulty fudge

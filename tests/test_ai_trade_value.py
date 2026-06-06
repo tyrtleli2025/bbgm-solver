@@ -78,10 +78,10 @@ _LEAGUE_ROSTERS = {
 }
 LEAGUE = league_value_stats(_LEAGUE_ROSTERS, current_season=SEASON, salary_cap=SALARY_CAP_DEFAULT)
 
-# Convenience: compute z-score using the same fixed-constant formula as sum_values
+# Convenience: compute z-score using the same league-derived stats as sum_values
 def _z(player: dict) -> float:
     base = player_base_value(player, LEAGUE)
-    return zscore(base, _VALUE_CENTRE, _VALUE_SCALE)
+    return zscore(base, LEAGUE["playerOvrMean"], LEAGUE["playerOvrStd"])
 
 
 # ---------------------------------------------------------------------------
@@ -92,8 +92,8 @@ def _z(player: dict) -> float:
 class TestLeagueStats:
 
     def test_league_has_required_keys(self):
-        # value_mean / value_std are no longer returned — ZenGM uses fixed constants
-        for key in ("ovr_mean", "ovr_std", "salary_cap", "current_season", "is_offseason"):
+        for key in ("ovr_mean", "ovr_std", "playerOvrMean", "playerOvrStd",
+                    "salary_cap", "current_season", "is_offseason"):
             assert key in LEAGUE, f"Missing key: {key}"
 
     def test_ovr_std_positive(self):
@@ -106,6 +106,8 @@ class TestLeagueStats:
     def test_empty_rosters_returns_defaults(self):
         lg = league_value_stats({})
         assert lg["ovr_mean"] == pytest.approx(47.0)
+        assert lg["playerOvrMean"] == pytest.approx(47.0)
+        assert lg["playerOvrStd"] == pytest.approx(10.0)
 
     def test_higher_ovr_gives_higher_base_value(self):
         low  = player_base_value(_player(50), LEAGUE)
@@ -562,9 +564,9 @@ def _manual_sum_one(
     age = float((player.get("age") or 27.0))
     contracts_factor = 2.0 if strategy == "rebuilding" else 0.5
 
-    # 1. Base z-score using fixed normalisation constants (≡ ZenGM playerOvrMean/Std)
+    # 1. Base z-score using league-computed playerOvrMean / playerOvrStd (§ 4)
     base  = player_base_value(player, lg)
-    raw_v = (base - _VALUE_CENTRE) / _VALUE_SCALE
+    raw_v = (base - lg["playerOvrMean"]) / lg["playerOvrStd"]
     v = raw_v
 
     # 2. Difficulty — positive values only, BEFORE strategy
