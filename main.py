@@ -293,6 +293,7 @@ def main(argv: list[str] | None = None) -> int:
             port=args.port,
             ssl_cert=getattr(args, "ssl_cert", None),
             ssl_key=getattr(args, "ssl_key", None),
+            use_v=args.use_v_function,
         )
         return 0   # start_server blocks until Ctrl-C; this line is unreachable
 

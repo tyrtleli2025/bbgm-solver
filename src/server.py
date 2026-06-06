@@ -94,8 +94,9 @@ const body=JSON.stringify({players:pl,gameAttributes:ga,teams:tm,tid});
 try{
   const d=await(await fetch('http://localhost:PORT/solve',{
     method:'POST',headers:{'Content-Type':'application/json'},body})).json();
+  const fmt=(s)=>d.use_v?('+'+s.toFixed(4)+'V'):('+'+s.toFixed(1)+'J');
   alert((d.trades||[]).slice(0,5).map((t,i)=>
-    `#${i+1} ${t.team} ${t.trade_type} +${(t.net_lineup_score||0).toFixed(1)}J dv=${(t.dv||0).toFixed(2)}\\n`+
+    `#${i+1} ${t.team} ${t.trade_type} ${fmt(t.net_lineup_score||0)} dv=${(t.dv||0).toFixed(2)}\\n`+
     (t.incoming||[]).map(p=>' IN: '+(p.name||p.pid)).join('\\n')+'\\n'+
     (t.outgoing||[]).map(p=>'OUT: '+(p.name||p.pid)).join('\\n')
   ).join('\\n---\\n')||'No trades found')
@@ -229,17 +230,18 @@ def _serialise_sequences(sequences: list) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def solve(payload: dict) -> dict:
+def solve(payload: dict, use_v: bool = False) -> dict:
     """
     Run the full solver pipeline on a ZenGM-shaped payload dict.
 
     Parameters
     ----------
     payload : dict with keys 'players', 'gameAttributes', 'teams', 'tid'.
+    use_v   : when True, use the horizon-aware V function (ΔV) instead of J.
 
     Returns
     -------
-    JSON-serialisable dict with 'trades' and 'sequences'.
+    JSON-serialisable dict with 'trades', 'sequences', and 'use_v'.
     """
     my_tid = int(payload.get("tid", 0))
     my_roster_df, league_rosters_dict, cap_info = parse_league_data(
@@ -256,8 +258,8 @@ def solve(payload: dict) -> dict:
     )
 
     log.info(
-        "Solving for tid=%d  my=%d players  opponents=%d teams  cap=$%.0fK",
-        my_tid, len(my_roster_df), len(league_rosters_dict), cap_info["salary_cap"],
+        "Solving for tid=%d  my=%d players  opponents=%d teams  cap=$%.0fK  use_v=%s",
+        my_tid, len(my_roster_df), len(league_rosters_dict), cap_info["salary_cap"], use_v,
     )
 
     trades = find_best_trades(
@@ -265,11 +267,14 @@ def solve(payload: dict) -> dict:
         league_rosters_dict,
         league=league,
         salary_cap=cap_info["salary_cap"],
+        current_season=int(league.get("current_season", 0)),
+        use_v_function=use_v,
         top_n=5,
     )
 
     return {
         "cap":       cap_info["salary_cap"],
+        "use_v":     use_v,
         "trades":    _serialise_trades(trades),
         "sequences": [],
     }
@@ -357,7 +362,8 @@ class SolverHandler(BaseHTTPRequestHandler):
             length  = int(self.headers.get("Content-Length", 0))
             body    = self.rfile.read(length)
             payload = json.loads(body)
-            result  = solve(payload) if path == "/solve" else evaluate(payload)
+            use_v   = getattr(self.server, "use_v", False)
+            result  = solve(payload, use_v=use_v) if path == "/solve" else evaluate(payload)
             self._send(200, result)
         except ValueError as exc:
             self._send(400, {"error": str(exc)})
@@ -388,6 +394,7 @@ def start_server(
     port: int = DEFAULT_PORT,
     ssl_cert: str | None = None,
     ssl_key:  str | None = None,
+    use_v:    bool = False,
 ) -> None:
     """
     Start the solver HTTP server and block until Ctrl-C.
@@ -397,6 +404,7 @@ def start_server(
     port     : TCP port to listen on (default 8888).
     ssl_cert : path to PEM certificate file for HTTPS (optional).
     ssl_key  : path to PEM private-key file for HTTPS (optional).
+    use_v    : when True, use the V function (ΔV) instead of J for trade scoring.
 
     HTTPS / mixed-content note
     --------------------------
@@ -410,6 +418,7 @@ def start_server(
     """
     scheme = "http"
     httpd  = HTTPServer(("localhost", port), SolverHandler)
+    httpd.use_v = use_v
 
     if ssl_cert and ssl_key:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
