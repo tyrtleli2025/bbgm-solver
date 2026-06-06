@@ -437,6 +437,87 @@ def sum_values(
     return total
 
 
+def sum_values_debug(
+    assets: list[PlayerRatings],
+    league: League,
+    strategy: str,
+    include_injuries: bool = False,
+    difficulty: float = 0.0,
+) -> tuple[float, list[dict]]:
+    """
+    Like sum_values but returns detailed breakdown for each asset.
+    Returns (total, [breakdowns]) where each breakdown contains:
+      name, base_value, raw_v, strategy_mult, injury_mult, contract_adj,
+      v_before_exp, final_v
+    """
+    contracts_factor = 2.0 if strategy == "rebuilding" else 0.5
+    total = 0.0
+    breakdowns = []
+
+    for player in assets:
+        name = str(_get(player, "name") or f"pid_{_get(player, 'pid')}")
+        age = float(_get(player, "age") or 27.0)
+
+        # 1. Base z-score
+        base = player_base_value(player, league)
+        raw_v = zscore(base, _VALUE_CENTRE, _VALUE_SCALE)
+        v = raw_v
+
+        # 2. Difficulty fudge
+        difficulty_mult = 1.0
+        if difficulty != 0.0 and v > 0:
+            difficulty_mult = 1.0 + 0.1 * difficulty
+            v *= difficulty_mult
+
+        # 3. Strategy age multiplier
+        strategy_mult = _strategy_multiplier(age, strategy)
+        v *= strategy_mult
+
+        # 4. Injury discount
+        injury_mult = 1.0
+        if include_injuries:
+            games = int(_get(player, "injured_games_remaining") or 0)
+            injury_mult = _injury_factor(games)
+            v *= injury_mult
+
+        # 5. Negative-value dampening
+        if v < 0:
+            v /= 20.0
+
+        # 6. Contract value
+        cv = contract_value(player, raw_v, league)
+        contract_adj = contracts_factor * cv
+        v += contract_adj
+
+        # 7. Just-drafted floor
+        if _get(player, "just_drafted"):
+            v = max(0.0, v)
+
+        # 8. Star exponent
+        v_before_exp = v
+        if v > 1:
+            v = v ** EXPONENT
+
+        total += v
+
+        breakdowns.append({
+            "name": name,
+            "age": age,
+            "base_value": base,
+            "raw_v": raw_v,
+            "difficulty_mult": difficulty_mult,
+            "strategy_mult": strategy_mult,
+            "injury_mult": injury_mult,
+            "contract_value": cv,
+            "contract_adj": contract_adj,
+            "v_before_exp": v_before_exp,
+            "final_v": v,
+            "exponent_applied": v != v_before_exp,
+        })
+
+    return total, breakdowns
+
+
 # ---------------------------------------------------------------------------
 # § 2  Evaluate dv (from the other team's perspective)
 # ---------------------------------------------------------------------------
@@ -469,8 +550,8 @@ def evaluate_dv(
         strategy = infer_strategy(other_team_roster)
 
     # From the AI's perspective:
-    #   assetsAdded   = what we send it   → check injuries
-    #   assetsRemoved = what it gives us  → apply difficulty
+    #   assetsAdded   = what we send it (they receive)
+    #   assetsRemoved = what it gives us (they lose)
     dv_added   = sum_values(list(outgoing), league, strategy,
                             include_injuries=True,  difficulty=0.0)
     dv_removed = sum_values(list(incoming), league, strategy,
