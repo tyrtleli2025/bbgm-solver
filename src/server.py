@@ -94,9 +94,8 @@ const body=JSON.stringify({players:pl,gameAttributes:ga,teams:tm,tid});
 try{
   const d=await(await fetch('http://localhost:PORT/solve',{
     method:'POST',headers:{'Content-Type':'application/json'},body})).json();
-  const fmt=(s)=>d.use_v?('+'+s.toFixed(4)+'V'):('+'+s.toFixed(1)+'J');
   alert((d.trades||[]).slice(0,5).map((t,i)=>
-    `#${i+1} ${t.team} ${t.trade_type} ${fmt(t.net_lineup_score||0)} dv=${(t.dv||0).toFixed(2)}\\n`+
+    `#${i+1} ${t.team} ${t.trade_type} +${(t.net_lineup_score||0).SCOREFMT} dv=${(t.dv||0).toFixed(2)}\\n`+
     (t.incoming||[]).map(p=>' IN: '+(p.name||p.pid)).join('\\n')+'\\n'+
     (t.outgoing||[]).map(p=>'OUT: '+(p.name||p.pid)).join('\\n')
   ).join('\\n---\\n')||'No trades found')
@@ -140,16 +139,17 @@ try{
 })()"""
 
 
-def _minify_bm(raw: str, port: int, scheme: str) -> str:
+def _minify_bm(raw: str, port: int, scheme: str, use_v: bool = False) -> str:
     import re
-    body = raw.replace("\n", "").replace("PORT", str(port))
+    score_fmt = "toFixed(4)+'V'" if use_v else "toFixed(1)+'J'"
+    body = raw.replace("\n", "").replace("PORT", str(port)).replace("SCOREFMT", score_fmt)
     body = body.replace("http://localhost", f"{scheme}://localhost")
     return f"javascript:{re.sub(r'  +', ' ', body)}"
 
 
-def make_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str:
+def make_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http", use_v: bool = False) -> str:
     """Return the trade-finder `javascript:` URL."""
-    return _minify_bm(BOOKMARKLET_BODY, port, scheme)
+    return _minify_bm(BOOKMARKLET_BODY, port, scheme, use_v=use_v)
 
 
 def make_eval_bookmarklet(port: int = DEFAULT_PORT, scheme: str = "http") -> str:
@@ -426,7 +426,7 @@ def start_server(
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
 
-    bm      = make_bookmarklet(port, scheme=scheme)
+    bm      = make_bookmarklet(port, scheme=scheme, use_v=use_v)
     bm_eval = make_eval_bookmarklet(port, scheme=scheme)
     print()
     print("=" * 70)
